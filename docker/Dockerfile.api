@@ -1,0 +1,30 @@
+# Build stage
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache gcc musl-dev
+
+WORKDIR /build
+
+# Cache dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Build
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /api ./cmd/api/
+
+# Runtime stage
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=builder /api /usr/local/bin/api
+
+# Create data directory
+RUN mkdir -p /data
+
+VOLUME ["/data"]
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/api"]

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: proxy-scanner-data
+  namespace: proxy-scanner
+  labels:
+    app.kubernetes.io/part-of: proxy-scanner
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # Use your cluster's default storage class, or specify one:
+  # storageClassName: hcloud-volumes

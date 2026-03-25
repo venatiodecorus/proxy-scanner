@@ -1,0 +1,38 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (local dev)
+*.db
+candidates.json
+
+# GeoLite2 tarballs (extracted .mmdb files in data/ are tracked)
+GeoLite2-*.tar.gz
+
+# Build artifacts
+dist/

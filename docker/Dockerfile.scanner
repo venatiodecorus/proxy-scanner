@@ -1,0 +1,27 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache masscan bash
+
+# Create data directory
+RUN mkdir -p /data /config
+
+# Copy all exclude list fragments and merge them at build time.
+# This strips comments and blank lines to produce a clean CIDR-only file
+# that masscan can parse without issues.
+COPY config/exclude/ /config/exclude.d/
+RUN cat /config/exclude.d/*.conf \
+    | grep -v '^#' \
+    | grep -v '^$' \
+    | sed 's/#.*//' \
+    | sed 's/[[:space:]]*$//' \
+    | grep -v '^$' \
+    > /config/exclude.conf \
+    && rm -rf /config/exclude.d/ \
+    && echo "Exclude list entries: $(wc -l < /config/exclude.conf)"
+
+COPY docker/scan.sh /usr/local/bin/scan.sh
+RUN chmod +x /usr/local/bin/scan.sh
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/local/bin/scan.sh"]
