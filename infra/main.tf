@@ -41,16 +41,17 @@ resource "openstack_compute_keypair_v2" "proxy_scanner" {
 }
 
 # ---------------------------------------------------------------------------
-# Security group — SSH only
+# Security group — use the default security group
 # ---------------------------------------------------------------------------
+# OVH has a low security group quota. The default security group already
+# allows all egress. We just add SSH ingress rules to it.
 
-resource "openstack_networking_secgroup_v2" "proxy_scanner" {
-  name        = "proxy-scanner-sg"
-  description = "Security group for proxy-scanner VPS — SSH only"
+data "openstack_networking_secgroup_v2" "default" {
+  name = "default"
 }
 
 resource "openstack_networking_secgroup_rule_v2" "ssh_ipv4" {
-  security_group_id = openstack_networking_secgroup_v2.proxy_scanner.id
+  security_group_id = data.openstack_networking_secgroup_v2.default.id
   direction         = "ingress"
   ethertype         = "IPv4"
   protocol          = "tcp"
@@ -60,27 +61,12 @@ resource "openstack_networking_secgroup_rule_v2" "ssh_ipv4" {
 }
 
 resource "openstack_networking_secgroup_rule_v2" "ssh_ipv6" {
-  security_group_id = openstack_networking_secgroup_v2.proxy_scanner.id
+  security_group_id = data.openstack_networking_secgroup_v2.default.id
   direction         = "ingress"
   ethertype         = "IPv6"
   protocol          = "tcp"
   port_range_min    = 22
   port_range_max    = 22
-  remote_ip_prefix  = "::/0"
-}
-
-# Allow all outbound (required for masscan, Docker pulls, etc.)
-resource "openstack_networking_secgroup_rule_v2" "egress_ipv4" {
-  security_group_id = openstack_networking_secgroup_v2.proxy_scanner.id
-  direction         = "egress"
-  ethertype         = "IPv4"
-  remote_ip_prefix  = "0.0.0.0/0"
-}
-
-resource "openstack_networking_secgroup_rule_v2" "egress_ipv6" {
-  security_group_id = openstack_networking_secgroup_v2.proxy_scanner.id
-  direction         = "egress"
-  ethertype         = "IPv6"
   remote_ip_prefix  = "::/0"
 }
 
@@ -95,7 +81,7 @@ resource "openstack_compute_instance_v2" "proxy_scanner" {
   key_pair    = openstack_compute_keypair_v2.proxy_scanner.name
 
   security_groups = [
-    openstack_networking_secgroup_v2.proxy_scanner.name,
+    data.openstack_networking_secgroup_v2.default.name,
   ]
 
   user_data = templatefile("${path.module}/cloud-init.yaml", {
