@@ -1,0 +1,50 @@
+services:
+  api:
+    image: ghcr.io/venatiodecorus/proxy-scanner-api:latest
+    container_name: proxy-scanner-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - scanner-data:/data:ro
+    environment:
+      DB_PATH: /data/proxies.db
+      LISTEN_ADDR: ":8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  scanner:
+    image: ghcr.io/venatiodecorus/proxy-scanner-scanner:latest
+    container_name: proxy-scanner-scanner
+    profiles: ["scan"]
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    volumes:
+      - scanner-data:/data
+    environment:
+      SCAN_RATE: "50000"
+      SCAN_PORTS: "3128,8080,1080,8888,9050,8443,3129,80,443,1081"
+      OUTPUT_FILE: /data/candidates.json
+
+  validator:
+    image: ghcr.io/venatiodecorus/proxy-scanner-validator:latest
+    container_name: proxy-scanner-validator
+    profiles: ["scan"]
+    volumes:
+      - scanner-data:/data
+    environment:
+      SCAN_INPUT: /data/candidates.json
+      DB_PATH: /data/proxies.db
+      GEOIP_CITY_DB: /geoip/GeoLite2-City.mmdb
+      GEOIP_ASN_DB: /geoip/GeoLite2-ASN.mmdb
+      WORKERS: "500"
+      TIMEOUT: "10"
+      TEST_URL: "http://httpbin.org/ip"
+
+volumes:
+  scanner-data:

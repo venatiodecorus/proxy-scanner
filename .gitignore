@@ -36,3 +36,19 @@ GeoLite2-*.tar.gz
 
 # Build artifacts
 dist/
+
+# OpenStack credentials
+openrc.sh
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

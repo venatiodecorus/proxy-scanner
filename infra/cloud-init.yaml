@@ -1,0 +1,62 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+
+write_files:
+  - path: /opt/proxy-scanner/docker-compose.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ${compose_file}
+
+  - path: /etc/cron.d/proxy-scanner
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Proxy scanner schedule
+      # Run scanner every Sunday at 02:00 UTC
+      0 2 * * 0 root cd /opt/proxy-scanner && /usr/bin/docker compose --profile scan run --rm scanner >> /var/log/proxy-scanner-scan.log 2>&1
+      # Run validator every Monday at 06:00 UTC
+      0 6 * * 1 root cd /opt/proxy-scanner && /usr/bin/docker compose --profile scan run --rm validator >> /var/log/proxy-scanner-validate.log 2>&1
+
+  - path: /etc/logrotate.d/proxy-scanner
+    owner: root:root
+    permissions: "0644"
+    content: |
+      /var/log/proxy-scanner-*.log {
+        weekly
+        rotate 4
+        compress
+        missingok
+        notifempty
+      }
+
+runcmd:
+  # Install Docker Engine (official method)
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # Add ubuntu user to docker group
+  - usermod -aG docker ubuntu
+
+  # Enable and start Docker
+  - systemctl enable docker
+  - systemctl start docker
+
+  # Pull all images (--profile scan includes scanner + validator)
+  - cd /opt/proxy-scanner && docker compose --profile scan pull
+  # Start the API (only service without a profile, so it starts by default)
+  - cd /opt/proxy-scanner && docker compose up -d
+
+  # Signal that cloud-init is done
+  - echo "cloud-init complete: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/proxy-scanner/.cloud-init-done
