@@ -26,7 +26,7 @@ masscan 0.0.0.0/0 \
     --rate "${SCAN_RATE}" \
     --open \
     -oJ "${OUTPUT_FILE}" \
-    --source-port 40000-50000
+    --source-port 40000-56383
 
 echo "=== Scan Complete ==="
 echo "Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
