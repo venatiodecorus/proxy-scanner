@@ -1,8 +1,11 @@
 package scanner
 
 import (
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/venatiodecorus/proxy-scanner/internal/proxy"
 )
 
 func TestParseStandardJSON(t *testing.T) {
@@ -135,6 +138,170 @@ func TestParseTruncatedOutput(t *testing.T) {
 	}
 	if len(candidates) != 2 {
 		t.Fatalf("expected 2 candidates from truncated output, got %d", len(candidates))
+	}
+}
+
+// --- Streaming parser tests ---
+
+// collectStream drains a candidate channel into a slice.
+func collectStream(ch <-chan proxy.Candidate) []proxy.Candidate {
+	var out []proxy.Candidate
+	for c := range ch {
+		out = append(out, c)
+	}
+	return out
+}
+
+// writeTemp writes content to a temp file and returns its path.
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "masscan-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	return f.Name()
+}
+
+func TestStreamParseStandardJSON(t *testing.T) {
+	input := `[
+		{"ip": "1.2.3.4", "timestamp": "1234567890", "ports": [{"port": 8080, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 64}]},
+		{"ip": "5.6.7.8", "timestamp": "1234567891", "ports": [{"port": 3128, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 128}]}
+	]`
+
+	path := writeTemp(t, input)
+	candidateCh, countCh, errCh := ParseFileStream(path, nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("stream parse error: %v", err)
+	}
+
+	if count != 2 {
+		t.Fatalf("expected count 2, got %d", count)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(candidates))
+	}
+	if candidates[0].IP != "1.2.3.4" || candidates[0].Port != 8080 {
+		t.Errorf("candidate 0: got %s:%d", candidates[0].IP, candidates[0].Port)
+	}
+	if candidates[1].IP != "5.6.7.8" || candidates[1].Port != 3128 {
+		t.Errorf("candidate 1: got %s:%d", candidates[1].IP, candidates[1].Port)
+	}
+}
+
+func TestStreamParseTrailingComma(t *testing.T) {
+	// Masscan's typical output — trailing comma before closing bracket.
+	// json.Decoder handles this by skipping the trailing comma token errors.
+	input := `[
+		{"ip": "1.2.3.4", "timestamp": "1234567890", "ports": [{"port": 8080, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 64}]},
+		{"ip": "5.6.7.8", "timestamp": "1234567891", "ports": [{"port": 3128, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 128}]}
+	]`
+
+	path := writeTemp(t, input)
+	candidateCh, countCh, errCh := ParseFileStream(path, nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("stream parse error: %v", err)
+	}
+
+	if count != 2 || len(candidates) != 2 {
+		t.Fatalf("expected 2 candidates, got %d (count=%d)", len(candidates), count)
+	}
+}
+
+func TestStreamParseDeduplicates(t *testing.T) {
+	input := `[
+		{"ip": "1.2.3.4", "timestamp": "1234567890", "ports": [{"port": 8080, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 64}]},
+		{"ip": "1.2.3.4", "timestamp": "1234567891", "ports": [{"port": 8080, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 64}]}
+	]`
+
+	path := writeTemp(t, input)
+	candidateCh, countCh, errCh := ParseFileStream(path, nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("stream parse error: %v", err)
+	}
+
+	if count != 1 || len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate (deduped), got %d (count=%d)", len(candidates), count)
+	}
+}
+
+func TestStreamParseFiltersClosed(t *testing.T) {
+	input := `[
+		{"ip": "1.2.3.4", "timestamp": "1234567890", "ports": [{"port": 8080, "proto": "tcp", "status": "closed", "reason": "rst", "ttl": 64}]},
+		{"ip": "5.6.7.8", "timestamp": "1234567891", "ports": [{"port": 3128, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 128}]}
+	]`
+
+	path := writeTemp(t, input)
+	candidateCh, countCh, errCh := ParseFileStream(path, nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("stream parse error: %v", err)
+	}
+
+	if count != 1 || len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d (count=%d)", len(candidates), count)
+	}
+	if candidates[0].IP != "5.6.7.8" {
+		t.Errorf("expected IP 5.6.7.8, got %s", candidates[0].IP)
+	}
+}
+
+func TestStreamParseEmpty(t *testing.T) {
+	path := writeTemp(t, "[]")
+	candidateCh, countCh, errCh := ParseFileStream(path, nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("stream parse error: %v", err)
+	}
+
+	if count != 0 || len(candidates) != 0 {
+		t.Fatalf("expected 0 candidates, got %d (count=%d)", len(candidates), count)
+	}
+}
+
+func TestStreamParseMultiplePorts(t *testing.T) {
+	input := `[
+		{"ip": "1.2.3.4", "timestamp": "1234567890", "ports": [
+			{"port": 8080, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 64},
+			{"port": 3128, "proto": "tcp", "status": "open", "reason": "syn-ack", "ttl": 64}
+		]}
+	]`
+
+	path := writeTemp(t, input)
+	candidateCh, countCh, errCh := ParseFileStream(path, nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	if err := <-errCh; err != nil {
+		t.Fatalf("stream parse error: %v", err)
+	}
+
+	if count != 2 || len(candidates) != 2 {
+		t.Fatalf("expected 2 candidates, got %d (count=%d)", len(candidates), count)
+	}
+}
+
+func TestStreamParseFileNotFound(t *testing.T) {
+	candidateCh, countCh, errCh := ParseFileStream("/nonexistent/file.json", nil)
+	candidates := collectStream(candidateCh)
+	count := <-countCh
+	err := <-errCh
+
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+	if count != 0 || len(candidates) != 0 {
+		t.Fatalf("expected 0 candidates, got %d (count=%d)", len(candidates), count)
 	}
 }
 

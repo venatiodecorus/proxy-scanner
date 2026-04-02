@@ -78,19 +78,6 @@ func run(logger *slog.Logger) error {
 		cancel()
 	}()
 
-	// Parse masscan output
-	logger.Info("parsing scan results", "file", scanInput)
-	candidates, err := scanner.ParseFile(scanInput)
-	if err != nil {
-		return fmt.Errorf("parsing scan results: %w", err)
-	}
-	logger.Info("parsed candidates", "count", len(candidates))
-
-	if len(candidates) == 0 {
-		logger.Info("no candidates to validate, exiting")
-		return nil
-	}
-
 	// Open database
 	db, err := database.Open(dbPath)
 	if err != nil {
@@ -132,12 +119,18 @@ func run(logger *slog.Logger) error {
 	}
 	checker := proxy.NewChecker(checkerCfg)
 
+	// Stream-parse masscan output. This uses a streaming JSON decoder so we
+	// never hold the entire file in memory — critical for large scan outputs
+	// (1GB+) on memory-constrained hosts.
+	logger.Info("streaming scan results", "file", scanInput)
+	candidateStream, countCh, parseErrCh := scanner.ParseFileStream(scanInput, logger)
+
 	// Worker pool
 	var verified atomic.Int64
 	var processed atomic.Int64
-	total := len(candidates)
+	var total atomic.Int64
 
-	candidateCh := make(chan proxy.Candidate, workers*2)
+	workerCh := make(chan proxy.Candidate, workers*2)
 	var wg sync.WaitGroup
 
 	// Progress reporter
@@ -151,10 +144,14 @@ func run(logger *slog.Logger) error {
 			case <-ticker.C:
 				p := processed.Load()
 				v := verified.Load()
-				pct := float64(p) / float64(total) * 100
+				t := total.Load()
+				var pct float64
+				if t > 0 {
+					pct = float64(p) / float64(t) * 100
+				}
 				logger.Info("progress",
 					"processed", p,
-					"total", total,
+					"total", t,
 					"percent", fmt.Sprintf("%.1f%%", pct),
 					"verified", v,
 				)
@@ -167,7 +164,7 @@ func run(logger *slog.Logger) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for candidate := range candidateCh {
+			for candidate := range workerCh {
 				if ctx.Err() != nil {
 					return
 				}
@@ -211,16 +208,37 @@ func run(logger *slog.Logger) error {
 		}()
 	}
 
-	// Feed candidates to workers
-	logger.Info("starting validation", "workers", workers, "candidates", total)
-	for _, c := range candidates {
+	// Feed candidates from the streaming parser directly to workers.
+	// The parser sends candidates one at a time as it reads them from disk,
+	// so memory usage stays constant regardless of file size.
+	logger.Info("starting validation", "workers", workers)
+	for candidate := range candidateStream {
 		select {
-		case candidateCh <- c:
+		case workerCh <- candidate:
 		case <-ctx.Done():
-			break
+			// Drain remaining candidates from the stream to let the parser goroutine exit.
+			for range candidateStream {
+			}
 		}
 	}
-	close(candidateCh)
+	close(workerCh)
+
+	// Collect parse results
+	totalCandidates := <-countCh
+	total.Store(int64(totalCandidates))
+	if parseErr := <-parseErrCh; parseErr != nil {
+		return fmt.Errorf("parsing scan results: %w", parseErr)
+	}
+
+	logger.Info("parsed candidates", "count", totalCandidates)
+
+	if totalCandidates == 0 {
+		logger.Info("no candidates to validate, exiting")
+		if err := db.FinishScanRun(runID, 0, 0, "completed"); err != nil {
+			return fmt.Errorf("finishing scan run: %w", err)
+		}
+		return nil
+	}
 
 	// Wait for workers to finish
 	wg.Wait()
@@ -232,13 +250,13 @@ func run(logger *slog.Logger) error {
 	}
 
 	// Finish scan run
-	if err := db.FinishScanRun(runID, total, totalVerified, status); err != nil {
+	if err := db.FinishScanRun(runID, totalCandidates, totalVerified, status); err != nil {
 		return fmt.Errorf("finishing scan run: %w", err)
 	}
 
 	logger.Info("validation complete",
 		"status", status,
-		"candidates", total,
+		"candidates", totalCandidates,
 		"verified", totalVerified,
 		"run_id", runID,
 	)

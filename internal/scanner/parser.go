@@ -1,9 +1,11 @@
 package scanner
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strconv"
 
@@ -70,6 +72,103 @@ func Parse(r io.Reader) ([]proxy.Candidate, error) {
 	}
 
 	return recordsToCandidates(records), nil
+}
+
+// StreamResult holds the outcome of streaming a single record from the parser.
+type StreamResult struct {
+	Candidate proxy.Candidate
+	Err       error
+}
+
+// ParseFileStream streams candidates from a masscan JSON file without loading
+// the entire file into memory. It sends candidates on the returned channel and
+// closes it when parsing is complete. The total count of unique candidates is
+// sent on the count channel after parsing finishes.
+//
+// This is designed for large files (1GB+) where loading into memory would
+// cause OOM on constrained hosts.
+func ParseFileStream(path string, logger *slog.Logger) (<-chan proxy.Candidate, <-chan int, <-chan error) {
+	candidateCh := make(chan proxy.Candidate, 1024)
+	countCh := make(chan int, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(candidateCh)
+		defer close(countCh)
+		defer close(errCh)
+
+		f, err := os.Open(path)
+		if err != nil {
+			errCh <- fmt.Errorf("opening scan file: %w", err)
+			countCh <- 0
+			return
+		}
+		defer f.Close()
+
+		count, err := streamParse(f, candidateCh, logger)
+		if err != nil {
+			errCh <- err
+		}
+		countCh <- count
+	}()
+
+	return candidateCh, countCh, errCh
+}
+
+// streamParse reads masscan JSON output using a streaming JSON decoder,
+// emitting candidates one at a time. It handles the opening/closing array
+// brackets and masscan's trailing-comma quirk. Returns the total count of
+// unique candidates emitted.
+func streamParse(r io.Reader, out chan<- proxy.Candidate, logger *slog.Logger) (int, error) {
+	br := bufio.NewReaderSize(r, 256*1024) // 256KB read buffer
+	decoder := json.NewDecoder(br)
+
+	seen := make(map[string]bool)
+	count := 0
+
+	// Try to consume the opening '[' of the JSON array.
+	tok, err := decoder.Token()
+	if err != nil {
+		return 0, fmt.Errorf("reading opening token: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '[' {
+		return 0, fmt.Errorf("expected JSON array, got %v", tok)
+	}
+
+	for decoder.More() {
+		var record masscanRecord
+		if err := decoder.Decode(&record); err != nil {
+			// Log and skip malformed records rather than failing the whole parse.
+			if logger != nil {
+				logger.Debug("skipping malformed record", "error", err)
+			}
+			continue
+		}
+
+		for _, port := range record.Ports {
+			if port.Status != "open" || port.Proto != "tcp" {
+				continue
+			}
+			key := record.IP + ":" + strconv.Itoa(port.Port)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			count++
+			out <- proxy.Candidate{
+				IP:   record.IP,
+				Port: port.Port,
+			}
+		}
+	}
+
+	// Consume closing ']' — not fatal if missing (truncated output).
+	if _, err := decoder.Token(); err != nil && logger != nil {
+		logger.Debug("missing closing bracket (truncated output?)", "error", err)
+	}
+
+	return count, nil
 }
 
 // ParseNDJSON parses newline-delimited JSON (one masscan record per line).

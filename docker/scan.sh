@@ -4,6 +4,7 @@ set -euo pipefail
 # Configuration via environment variables
 SCAN_RATE="${SCAN_RATE:-50000}"
 SCAN_PORTS="${SCAN_PORTS:-3128,8080,1080,8888,9050,8443,3129,80,443,1081}"
+SCAN_ADAPTER="${SCAN_ADAPTER:-ens3}"
 EXCLUDE_FILE="${EXCLUDE_FILE:-/config/exclude.conf}"
 OUTPUT_FILE="${OUTPUT_FILE:-/data/candidates.json}"
 
@@ -24,6 +25,7 @@ masscan 0.0.0.0/0 \
     -p"${SCAN_PORTS}" \
     --excludefile "${EXCLUDE_FILE}" \
     --rate "${SCAN_RATE}" \
+    --adapter "${SCAN_ADAPTER}" \
     --open \
     -oJ "${OUTPUT_FILE}" \
     --source-port 40000-56383
