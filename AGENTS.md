@@ -61,7 +61,7 @@ deploy/                  — Example Kubernetes manifests (reference only)
 ### API (`cmd/api`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
 - `LISTEN_ADDR` — Address to listen on (default: `:8080`)
-- `API_TOKEN` — Bearer token required for all endpoints except `/v1/health` (default: `changeme-proxy-scanner-2026`)
+- `API_TOKEN` — Bearer token required for all endpoints except `/v1/health`. Auth is disabled when unset (default: unset/disabled)
 
 ## Coding Conventions
 

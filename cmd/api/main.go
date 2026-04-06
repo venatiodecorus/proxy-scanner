@@ -32,11 +32,12 @@ func main() {
 func run(logger *slog.Logger) error {
 	dbPath := envOrDefault("DB_PATH", "/data/proxies.db")
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
-	apiToken := envOrDefault("API_TOKEN", "changeme-proxy-scanner-2026")
+	apiToken := os.Getenv("API_TOKEN")
 
 	logger.Info("starting api server",
 		"db_path", dbPath,
 		"listen_addr", listenAddr,
+		"auth_enabled", apiToken != "",
 	)
 
 	db, err := database.Open(dbPath)
@@ -56,7 +57,7 @@ func run(logger *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:         listenAddr,
-		Handler:      loggingMiddleware(logger, authMiddleware(apiToken, logger, mux)),
+		Handler:      buildHandler(logger, apiToken, mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -211,6 +212,15 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+// buildHandler chains the middleware stack. Auth is only included if a token is set.
+func buildHandler(logger *slog.Logger, token string, mux http.Handler) http.Handler {
+	var handler http.Handler = mux
+	if token != "" {
+		handler = authMiddleware(token, logger, handler)
+	}
+	return loggingMiddleware(logger, handler)
 }
 
 // loggingMiddleware logs each request.

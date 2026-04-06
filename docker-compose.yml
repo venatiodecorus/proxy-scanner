@@ -6,11 +6,11 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - scanner-data:/data:ro
+      - scanner-data:/data
     environment:
       DB_PATH: /data/proxies.db
       LISTEN_ADDR: ":8080"
-      API_TOKEN: "changeme-proxy-scanner-2026"
+      # API_TOKEN: "changeme-proxy-scanner-2026"  # uncomment to enable auth
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/health"]
       interval: 30s
