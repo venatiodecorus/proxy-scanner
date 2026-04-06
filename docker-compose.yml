@@ -10,6 +10,7 @@ services:
     environment:
       DB_PATH: /data/proxies.db
       LISTEN_ADDR: ":8080"
+      API_TOKEN: "changeme-proxy-scanner-2026"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/health"]
       interval: 30s

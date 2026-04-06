@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -31,6 +32,7 @@ func main() {
 func run(logger *slog.Logger) error {
 	dbPath := envOrDefault("DB_PATH", "/data/proxies.db")
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
+	apiToken := envOrDefault("API_TOKEN", "changeme-proxy-scanner-2026")
 
 	logger.Info("starting api server",
 		"db_path", dbPath,
@@ -54,7 +56,7 @@ func run(logger *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:         listenAddr,
-		Handler:      loggingMiddleware(logger, mux),
+		Handler:      loggingMiddleware(logger, authMiddleware(apiToken, logger, mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -225,6 +227,33 @@ func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 			"duration_ms", time.Since(start).Milliseconds(),
 			"remote_addr", r.RemoteAddr,
 		)
+	})
+}
+
+// authMiddleware requires a valid Bearer token for all routes except /v1/health.
+func authMiddleware(token string, logger *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow health checks without auth
+		if r.URL.Path == "/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid authorization header"})
+			return
+		}
+
+		provided := auth[len(prefix):]
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			logger.Warn("rejected invalid api token", "remote_addr", r.RemoteAddr)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid api token"})
+			return
+		}
+
+		next.ServeHTTP(w, r)
 	})
 }
 
