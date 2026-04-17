@@ -51,19 +51,24 @@ func (d *DB) Close() error {
 func (d *DB) migrate() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS proxies (
-		id          INTEGER PRIMARY KEY AUTOINCREMENT,
-		ip          TEXT NOT NULL,
-		port        INTEGER NOT NULL,
-		protocol    TEXT NOT NULL,
-		anonymity   TEXT,
-		country     TEXT,
-		city        TEXT,
-		asn         INTEGER,
-		asn_org     TEXT,
-		latency_ms  INTEGER,
-		last_seen   DATETIME NOT NULL,
-		first_seen  DATETIME NOT NULL,
-		alive       BOOLEAN DEFAULT TRUE,
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		ip               TEXT NOT NULL,
+		port             INTEGER NOT NULL,
+		protocol         TEXT NOT NULL,
+		anonymity        TEXT,
+		country          TEXT,
+		city             TEXT,
+		asn              INTEGER,
+		asn_org          TEXT,
+		exit_ip          TEXT,
+		latency_ms       INTEGER,
+		supports_connect BOOLEAN DEFAULT FALSE,
+		tls_insecure     BOOLEAN DEFAULT FALSE,
+		blocklisted      BOOLEAN DEFAULT FALSE,
+		blocklists       TEXT,
+		last_seen        DATETIME NOT NULL,
+		first_seen       DATETIME NOT NULL,
+		alive            BOOLEAN DEFAULT TRUE,
 		UNIQUE(ip, port, protocol)
 	);
 
@@ -79,9 +84,54 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_proxies_alive ON proxies(alive, protocol);
 	CREATE INDEX IF NOT EXISTS idx_proxies_latency ON proxies(alive, latency_ms);
 	CREATE INDEX IF NOT EXISTS idx_proxies_country ON proxies(alive, country);
+	CREATE INDEX IF NOT EXISTS idx_proxies_blocklisted ON proxies(alive, blocklisted);
 	`
 	_, err := d.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	var exitIPExists int
+	d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name = 'exit_ip'").Scan(&exitIPExists)
+	if exitIPExists == 0 {
+		if _, err := d.db.Exec("ALTER TABLE proxies ADD COLUMN exit_ip TEXT"); err != nil {
+			return fmt.Errorf("migrating exit_ip column: %w", err)
+		}
+	}
+
+	var supportsConnectExists int
+	d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name = 'supports_connect'").Scan(&supportsConnectExists)
+	if supportsConnectExists == 0 {
+		if _, err := d.db.Exec("ALTER TABLE proxies ADD COLUMN supports_connect BOOLEAN DEFAULT FALSE"); err != nil {
+			return fmt.Errorf("migrating supports_connect column: %w", err)
+		}
+	}
+
+	var tlsInsecureExists int
+	d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name = 'tls_insecure'").Scan(&tlsInsecureExists)
+	if tlsInsecureExists == 0 {
+		if _, err := d.db.Exec("ALTER TABLE proxies ADD COLUMN tls_insecure BOOLEAN DEFAULT FALSE"); err != nil {
+			return fmt.Errorf("migrating tls_insecure column: %w", err)
+		}
+	}
+
+	var blocklistedExists int
+	d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name = 'blocklisted'").Scan(&blocklistedExists)
+	if blocklistedExists == 0 {
+		if _, err := d.db.Exec("ALTER TABLE proxies ADD COLUMN blocklisted BOOLEAN DEFAULT FALSE"); err != nil {
+			return fmt.Errorf("migrating blocklisted column: %w", err)
+		}
+	}
+
+	var blocklistsExists int
+	d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name = 'blocklists'").Scan(&blocklistsExists)
+	if blocklistsExists == 0 {
+		if _, err := d.db.Exec("ALTER TABLE proxies ADD COLUMN blocklists TEXT"); err != nil {
+			return fmt.Errorf("migrating blocklists column: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // UpsertProxy inserts or updates a proxy record. If the proxy already exists
@@ -89,19 +139,26 @@ func (d *DB) migrate() error {
 func (d *DB) UpsertProxy(p *proxy.Proxy) error {
 	now := time.Now().UTC()
 	_, err := d.db.Exec(`
-		INSERT INTO proxies (ip, port, protocol, anonymity, country, city, asn, asn_org, latency_ms, last_seen, first_seen, alive)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO proxies (ip, port, protocol, anonymity, country, city, asn, asn_org, exit_ip, latency_ms, supports_connect, tls_insecure, blocklisted, blocklists, last_seen, first_seen, alive)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(ip, port, protocol) DO UPDATE SET
 			anonymity = excluded.anonymity,
 			country = excluded.country,
 			city = excluded.city,
 			asn = excluded.asn,
 			asn_org = excluded.asn_org,
+			exit_ip = excluded.exit_ip,
 			latency_ms = excluded.latency_ms,
+			supports_connect = excluded.supports_connect,
+			tls_insecure = excluded.tls_insecure,
+			blocklisted = excluded.blocklisted,
+			blocklists = excluded.blocklists,
 			last_seen = excluded.last_seen,
 			alive = excluded.alive
 	`, p.IP, p.Port, string(p.Protocol), string(p.Anonymity),
-		p.Country, p.City, p.ASN, p.ASNOrg, p.LatencyMs, now, now, p.Alive)
+		p.Country, p.City, p.ASN, p.ASNOrg, p.ExitIP, p.LatencyMs,
+		p.SupportsConnect, p.TLSInsecure, p.Blocklisted, p.Blocklists,
+		now, now, p.Alive)
 	if err != nil {
 		return fmt.Errorf("upserting proxy %s:%d: %w", p.IP, p.Port, err)
 	}
@@ -118,7 +175,7 @@ func (d *DB) MarkAllDead() error {
 // GetProxy returns a single proxy by ID.
 func (d *DB) GetProxy(id int64) (*proxy.Proxy, error) {
 	row := d.db.QueryRow(`
-		SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, latency_ms, last_seen, first_seen, alive
+		SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, exit_ip, latency_ms, supports_connect, tls_insecure, blocklisted, blocklists, last_seen, first_seen, alive
 		FROM proxies WHERE id = ?
 	`, id)
 	return scanProxy(row)
@@ -126,7 +183,7 @@ func (d *DB) GetProxy(id int64) (*proxy.Proxy, error) {
 
 // ListProxies returns proxies matching the given filter.
 func (d *DB) ListProxies(f proxy.ProxyFilter) ([]proxy.Proxy, error) {
-	query := "SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, latency_ms, last_seen, first_seen, alive FROM proxies"
+	query := "SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, exit_ip, latency_ms, supports_connect, tls_insecure, blocklisted, blocklists, last_seen, first_seen, alive FROM proxies"
 	where, args := buildWhere(f)
 	if where != "" {
 		query += " WHERE " + where
@@ -174,7 +231,7 @@ func (d *DB) RandomProxy(f proxy.ProxyFilter) (*proxy.Proxy, error) {
 	}
 
 	offset := rand.Intn(count)
-	query := "SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, latency_ms, last_seen, first_seen, alive FROM proxies"
+	query := "SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, exit_ip, latency_ms, supports_connect, tls_insecure, blocklisted, blocklists, last_seen, first_seen, alive FROM proxies"
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -319,6 +376,10 @@ func buildWhere(f proxy.ProxyFilter) (string, []interface{}) {
 		conditions = append(conditions, "latency_ms <= ?")
 		args = append(args, f.MaxLatency)
 	}
+	if f.Blocklisted != nil {
+		conditions = append(conditions, "blocklisted = ?")
+		args = append(args, *f.Blocklisted)
+	}
 
 	return strings.Join(conditions, " AND "), args
 }
@@ -331,12 +392,15 @@ type scannable interface {
 func scanProxy(s scannable) (*proxy.Proxy, error) {
 	var p proxy.Proxy
 	var protocol, anonymity string
-	var country, city, asnOrg sql.NullString
+	var country, city, asnOrg, exitIP sql.NullString
 	var latencyMs, asn sql.NullInt64
+	var supportsConnect, tlsInsecure, blocklisted, alive sql.NullBool
+	var blocklists sql.NullString
 	err := s.Scan(
 		&p.ID, &p.IP, &p.Port, &protocol, &anonymity,
-		&country, &city, &asn, &asnOrg, &latencyMs,
-		&p.LastSeen, &p.FirstSeen, &p.Alive,
+		&country, &city, &asn, &asnOrg, &exitIP, &latencyMs,
+		&supportsConnect, &tlsInsecure, &blocklisted, &blocklists,
+		&p.LastSeen, &p.FirstSeen, &alive,
 	)
 	if err != nil {
 		return nil, err
@@ -355,8 +419,26 @@ func scanProxy(s scannable) (*proxy.Proxy, error) {
 	if asnOrg.Valid {
 		p.ASNOrg = asnOrg.String
 	}
+	if exitIP.Valid {
+		p.ExitIP = exitIP.String
+	}
 	if latencyMs.Valid {
 		p.LatencyMs = int(latencyMs.Int64)
+	}
+	if supportsConnect.Valid {
+		p.SupportsConnect = supportsConnect.Bool
+	}
+	if tlsInsecure.Valid {
+		p.TLSInsecure = tlsInsecure.Bool
+	}
+	if blocklisted.Valid {
+		p.Blocklisted = blocklisted.Bool
+	}
+	if blocklists.Valid {
+		p.Blocklists = blocklists.String
+	}
+	if alive.Valid {
+		p.Alive = alive.Bool
 	}
 	return &p, nil
 }

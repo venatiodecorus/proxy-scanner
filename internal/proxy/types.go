@@ -23,19 +23,24 @@ const (
 
 // Proxy represents a validated proxy server.
 type Proxy struct {
-	ID        int64     `json:"id"`
-	IP        string    `json:"ip"`
-	Port      int       `json:"port"`
-	Protocol  Protocol  `json:"protocol"`
-	Anonymity Anonymity `json:"anonymity,omitempty"`
-	Country   string    `json:"country,omitempty"`
-	City      string    `json:"city,omitempty"`
-	ASN       int       `json:"asn,omitempty"`
-	ASNOrg    string    `json:"asn_org,omitempty"`
-	LatencyMs int       `json:"latency_ms,omitempty"`
-	LastSeen  time.Time `json:"last_seen"`
-	FirstSeen time.Time `json:"first_seen"`
-	Alive     bool      `json:"alive"`
+	ID              int64     `json:"id"`
+	IP              string    `json:"ip"`
+	Port            int       `json:"port"`
+	Protocol        Protocol  `json:"protocol"`
+	Anonymity       Anonymity `json:"anonymity,omitempty"`
+	Country         string    `json:"country,omitempty"`
+	City            string    `json:"city,omitempty"`
+	ASN             int       `json:"asn,omitempty"`
+	ASNOrg          string    `json:"asn_org,omitempty"`
+	ExitIP          string    `json:"exit_ip,omitempty"`
+	LatencyMs       int       `json:"latency_ms,omitempty"`
+	SupportsConnect bool      `json:"supports_connect"`
+	TLSInsecure     bool      `json:"tls_insecure"`
+	Blocklisted     bool      `json:"blocklisted"`
+	Blocklists      string    `json:"blocklists,omitempty"`
+	LastSeen        time.Time `json:"last_seen"`
+	FirstSeen       time.Time `json:"first_seen"`
+	Alive           bool      `json:"alive"`
 }
 
 // Candidate represents a raw scan result from masscan — an IP:port pair
@@ -47,14 +52,17 @@ type Candidate struct {
 
 // CheckResult is the outcome of validating a single candidate.
 type CheckResult struct {
-	Candidate Candidate
-	Protocol  Protocol
-	Anonymity Anonymity
-	Country   string
-	City      string
-	LatencyMs int
-	Alive     bool
-	Error     error
+	Candidate       Candidate
+	Protocol        Protocol
+	Anonymity       Anonymity
+	ExitIP          string
+	Country         string
+	City            string
+	LatencyMs       int
+	SupportsConnect bool
+	TLSInsecure     bool
+	Alive           bool
+	Error           error
 }
 
 // ScanRun tracks metadata about a scan/validation run.
@@ -73,6 +81,7 @@ type ProxyFilter struct {
 	Anonymity  Anonymity `json:"anonymity,omitempty"`
 	Country    string    `json:"country,omitempty"`
 	MaxLatency int       `json:"max_latency,omitempty"`
+	Blocklisted *bool    `json:"blocklisted,omitempty"`
 	AliveOnly  bool      `json:"alive_only"`
 	Limit      int       `json:"limit,omitempty"`
 	Offset     int       `json:"offset,omitempty"`
