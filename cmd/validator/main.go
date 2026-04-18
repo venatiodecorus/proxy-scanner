@@ -260,7 +260,27 @@ func run(logger *slog.Logger) error {
 	}
 
 	close(workerCh)
-	wg.Wait()
+
+	// Wait for workers with a hard timeout so the process always exits.
+	// Some proxy validations can hang on unresponsive targets; this ensures
+	// we don't block indefinitely after the queue is empty.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	shutdownTimeout := time.Duration(timeout)*time.Second + 30*time.Second
+	select {
+	case <-done:
+		// Workers finished cleanly
+	case <-time.After(shutdownTimeout):
+		logger.Warn("workers did not finish within timeout, forcing exit",
+			"timeout", shutdownTimeout,
+			"processed", processed.Load(),
+			"verified", verified.Load(),
+		)
+	}
 
 	totalVerified := int(verified.Load())
 	status := "completed"
