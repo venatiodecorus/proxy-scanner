@@ -1,43 +1,51 @@
 # Proxy Scanner
 
-A Kubernetes-native system that scans the public IPv4 space for open proxies (HTTP, HTTPS, SOCKS4, SOCKS5), validates them, measures latency, classifies anonymity level, enriches with GeoIP/ASN data, and exposes verified proxies via a REST API.
+A system that scans the public IPv4 space for open proxies (HTTP, HTTPS, SOCKS4, SOCKS5), validates them, measures latency, classifies anonymity level, enriches with GeoIP/ASN data, and exposes verified proxies via a REST API.
 
-Designed for GitOps deployment on k3s (Hetzner Cloud) with FluxCD.
+Deployed via Docker Compose.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   k3s Cluster (Hetzner)                  │
+│                  Docker Compose                          │
 │                                                         │
-│  ┌──────────────┐    CronJob (weekly)                   │
+│  ┌──────────────┐    on-demand (scan profile)           │
 │  │  scanner     │──→ masscan sweep of IPv4 space        │
-│  │  (masscan)   │    outputs candidate IPs to PVC       │
+│  │  (masscan)   │    outputs candidate IPs to volume    │
 │  └──────┬───────┘                                       │
 │         │ candidates.json                               │
 │         ▼                                               │
-│  ┌──────────────┐    Job (after scan completes)         │
-│  │  validator   │──→ Go: validates proxies, measures    │
-│  │  (Go)        │    latency, GeoIP/ASN tagging         │
+│  ┌──────────────┐    on-demand (scan profile)           │
+│  │  validator   │──→ Go: validates proxies, measures   │
+│  │  (Go)        │    latency, GeoIP/ASN tagging        │
 │  └──────┬───────┘                                       │
 │         │ SQLite                                        │
 │         ▼                                               │
-│  ┌──────────────┐    Deployment (always running)        │
+│  ┌──────────────┐    always running                      │
 │  │  api         │──→ REST API for proxy data            │
-│  │  (Go)        │                                       │
+│  │  (Go)        │    http://localhost:8080/v1/          │
 │  └──────────────┘                                       │
-│                                                         │
-│  Internal: http://proxy-api.proxy-scanner.svc/v1/       │
 └─────────────────────────────────────────────────────────┘
 ```
 
 Three components, three container images:
 
-| Component | Image | K8s Resource | Purpose |
-|-----------|-------|-------------|---------|
-| Scanner | `ghcr.io/venatiodecorus/proxy-scanner-scanner` | CronJob | Masscan sweep of IPv4 space for open proxy ports |
-| Validator | `ghcr.io/venatiodecorus/proxy-scanner-validator` | CronJob/Job | Validates candidates, measures latency, GeoIP/ASN enrichment |
-| API | `ghcr.io/venatiodecorus/proxy-scanner-api` | Deployment | REST API serving proxy data from SQLite |
+| Component | Image | Purpose |
+|-----------|-------|---------|
+| Scanner | `ghcr.io/venatiodecorus/proxy-scanner-scanner` | Masscan sweep of IPv4 space for open proxy ports |
+| Validator | `ghcr.io/venatiodecorus/proxy-scanner-validator` | Validates candidates, measures latency, GeoIP/ASN enrichment |
+| API | `ghcr.io/venatiodecorus/proxy-scanner-api` | REST API serving proxy data from SQLite |
+
+## Quick Start
+
+```bash
+# Pull images and start the API
+docker compose up -d api
+
+# Run a scan (scanner + validator)
+docker compose --profile scan up scanner validator
+```
 
 ## API Endpoints
 
@@ -65,21 +73,19 @@ Three components, three container images:
 
 ```bash
 # Get 5 fast elite SOCKS5 proxies in Germany
-curl "http://proxy-api.proxy-scanner/v1/proxies?protocol=socks5&anonymity=elite&country=DE&max_latency=500&limit=5"
+curl "http://localhost:8080/v1/proxies?protocol=socks5&anonymity=elite&country=DE&max_latency=500&limit=5"
 
 # Get a random HTTP proxy
-curl "http://proxy-api.proxy-scanner/v1/proxies/random?protocol=http"
+curl "http://localhost:8080/v1/proxies/random?protocol=http"
 
 # Stats overview
-curl "http://proxy-api.proxy-scanner/v1/stats"
+curl "http://localhost:8080/v1/stats"
 ```
 
 ## Prerequisites
 
-- Go 1.23+
-- GCC (for CGO / SQLite compilation)
-- Docker (for building images)
-- `masscan` (only needed if running the scanner locally)
+- Docker
+- Go 1.23+ and GCC (for local development only)
 
 ## Local Development
 
@@ -179,7 +185,7 @@ docker/
   Dockerfile.validator       Multi-stage Go build + GeoIP databases
   Dockerfile.api             Multi-stage Go build
   scan.sh                    Masscan wrapper script
-deploy/                      Example Kubernetes manifests (reference only)
+docker-compose.yml           Docker Compose configuration
 .github/workflows/
   ci.yaml                    Tests + vet on pull requests
   build-push.yaml            Build and push images to GHCR on push to main
@@ -189,7 +195,6 @@ deploy/                      Example Kubernetes manifests (reference only)
 
 - **Pull requests**: GitHub Actions runs `go test` and `go vet`
 - **Push to main**: Builds all 3 Docker images and pushes to GHCR with `sha-<commit>` and `latest` tags
-- **Deployment**: FluxCD in the infra repo watches GHCR for new image tags
 
 No additional secrets or configuration required. The workflow uses the built-in `GITHUB_TOKEN`.
 
@@ -202,7 +207,6 @@ To add a new exclusion (e.g., after an abuse complaint):
 1. Add the CIDR to `config/exclude/90-custom.conf`
 2. Commit and push to main
 3. GitHub Actions rebuilds the scanner image
-4. FluxCD rolls out the update
 
 ## Environment Variables
 

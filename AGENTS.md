@@ -2,15 +2,17 @@
 
 ## Project Overview
 
-This is a Go monorepo that produces three container images for an open proxy scanning system deployed on Kubernetes (k3s on Hetzner Cloud via FluxCD GitOps).
+This is a Go monorepo that produces three container images for an open proxy scanning system, deployed via Docker Compose.
 
 ## Architecture
 
 Three components, three container images:
 
-1. **Scanner** (`docker/Dockerfile.scanner`) — Alpine + masscan. Runs as a K8s CronJob. Scans IPv4 space for open proxy ports. Outputs JSON to a shared PVC.
-2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs as a K8s Job after the scanner. Reads masscan output, validates each candidate as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Writes to SQLite on the shared PVC.
-3. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs as a K8s Deployment. Serves proxy data from SQLite. Internal ClusterIP service for other cluster workloads.
+1. **Scanner** (`docker/Dockerfile.scanner`) — Alpine + masscan. Runs on-demand via Docker Compose scan profile. Scans IPv4 space for open proxy ports. Outputs JSON to a shared volume.
+2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs on-demand via Docker Compose scan profile after the scanner. Reads masscan output, validates each candidate as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Writes to SQLite on the shared volume.
+3. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs continuously. Serves proxy data from SQLite at `http://localhost:8080/v1/`.
+
+Scanner and validator use the `scan` profile in `docker-compose.yml` and are run on-demand. The API runs continuously by default.
 
 ## Code Structure
 
@@ -24,7 +26,7 @@ internal/scanner/        — Masscan output parser (parser.go)
 data/                    — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
 config/exclude/          — Modular CIDR exclusion lists (merged at Docker build time)
 docker/                  — Dockerfiles + scan.sh for all three images
-deploy/                  — Example Kubernetes manifests (reference only)
+docker-compose.yml       — Docker Compose configuration
 .github/workflows/       — CI (test on PR) and build+push (images to GHCR on main)
 ```
 
@@ -32,11 +34,12 @@ deploy/                  — Example Kubernetes manifests (reference only)
 
 - **Go module**: `github.com/venatiodecorus/proxy-scanner`
 - **Database**: SQLite with WAL mode. Single writer (validator), single reader (API). DB file at `/data/proxies.db`.
-- **Scan output**: Masscan JSON at `/data/candidates.json` on the shared PVC.
+- **Scan output**: Masscan JSON at `/data/candidates.json` on the shared volume.
 - **Container registry**: `ghcr.io/venatiodecorus/proxy-scanner-{scanner,validator,api}`
 - **GeoIP**: MaxMind GeoLite2-City + ASN databases bundled in the validator image at `/geoip/`. Source `.mmdb` files are committed in `data/`.
 - **Egress IP**: Validator auto-detects public IP at startup via external services (ipify, ifconfig.me, etc.). Override with `ORIGIN_IP` env var.
 - **CI/CD**: GitHub Actions builds and pushes all 3 images to GHCR on push to main. PRs run tests + vet.
+- **Docker Compose**: Scanner and validator are in the `scan` profile (`docker compose --profile scan up`). API runs by default (`docker compose up -d api`). Data persists via a named volume `scanner-data`.
 
 ## Development Guidelines
 
@@ -45,7 +48,6 @@ deploy/                  — Example Kubernetes manifests (reference only)
 - The API uses only the standard library `net/http` — no web framework.
 - Tests should be runnable with `go test ./...` without network access or external databases.
 - Dockerfiles use multi-stage builds. Final images are distroless (Go) or minimal Alpine (scanner).
-- The `deploy/` directory contains example K8s manifests for reference. The actual manifests live in a separate infra/FluxCD repo.
 
 ## Environment Variables
 
@@ -98,8 +100,8 @@ Files are numbered so they merge in predictable order via `cat config/exclude/*.
 
 ## Deployment Notes
 
-- Kubernetes manifests in `deploy/` are examples only. Real manifests go in the infra repo.
-- The three components share a single PVC mounted at `/data`.
-- Scanner CronJob runs weekly. Validator Job runs after scanner completes. API Deployment runs continuously.
-- Rate limit masscan to 50k pps on Hetzner Cloud to avoid abuse complaints.
+- Run the API continuously: `docker compose up -d api`
+- Run a scan: `docker compose --profile scan up scanner validator`
+- The three components share a named Docker volume `scanner-data` mounted at `/data`.
 - SQLite WAL mode allows concurrent reads (API) while the validator writes.
+- Rate limit masscan to 50k pps to avoid abuse complaints.
