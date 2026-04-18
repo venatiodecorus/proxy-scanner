@@ -203,6 +203,12 @@ func parseFilter(r *http.Request) proxy.ProxyFilter {
 	if v := q.Get("alive"); v == "false" || v == "0" {
 		f.AliveOnly = false
 	}
+	if v := q.Get("blocklisted"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			f.Blocklisted = &b
+		}
+	}
 
 	return f
 }

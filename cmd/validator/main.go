@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/venatiodecorus/proxy-scanner/internal/blocklist"
 	"github.com/venatiodecorus/proxy-scanner/internal/database"
 	"github.com/venatiodecorus/proxy-scanner/internal/proxy"
 	"github.com/venatiodecorus/proxy-scanner/internal/scanner"
@@ -42,6 +43,7 @@ func run(logger *slog.Logger) error {
 	timeout := envOrDefaultInt("TIMEOUT", 10)
 	testURL := envOrDefault("TEST_URL", "http://httpbin.org/ip")
 	originIP := envOrDefault("ORIGIN_IP", "")
+	skipBlocklist := envOrDefaultBool("SKIP_BLOCKLIST", false)
 
 	// Auto-detect egress IP if not explicitly set
 	if originIP == "" {
@@ -64,6 +66,7 @@ func run(logger *slog.Logger) error {
 		"timeout", timeout,
 		"test_url", testURL,
 		"origin_ip", originIP,
+		"skip_blocklist", skipBlocklist,
 	)
 
 	// Setup context with graceful shutdown
@@ -118,6 +121,15 @@ func run(logger *slog.Logger) error {
 		Logger:   logger,
 	}
 	checker := proxy.NewChecker(checkerCfg)
+
+	// Initialize blocklist checker
+	var blChecker *blocklist.Checker
+	if !skipBlocklist {
+		blChecker = blocklist.NewChecker(blocklist.WithLogger(logger))
+		logger.Info("blocklist checking enabled")
+	} else {
+		logger.Info("blocklist checking disabled")
+	}
 
 	// Stream-parse masscan output. This uses a streaming JSON decoder so we
 	// never hold the entire file in memory — critical for large scan outputs
@@ -175,20 +187,36 @@ func run(logger *slog.Logger) error {
 						continue
 					}
 
-					// GeoIP lookup
 					geo := geoip.Lookup(result.Candidate.IP)
 
 					p := &proxy.Proxy{
-						IP:        result.Candidate.IP,
-						Port:      result.Candidate.Port,
-						Protocol:  result.Protocol,
-						Anonymity: result.Anonymity,
-						Country:   geo.Country,
-						City:      geo.City,
-						ASN:       geo.ASN,
-						ASNOrg:    geo.ASNOrg,
-						LatencyMs: result.LatencyMs,
-						Alive:     true,
+						IP:              result.Candidate.IP,
+						Port:            result.Candidate.Port,
+						Protocol:        result.Protocol,
+						Anonymity:       result.Anonymity,
+						Country:         geo.Country,
+						City:            geo.City,
+						ASN:             geo.ASN,
+						ASNOrg:          geo.ASNOrg,
+						ExitIP:          result.ExitIP,
+						LatencyMs:       result.LatencyMs,
+						SupportsConnect: result.SupportsConnect,
+						TLSInsecure:     result.TLSInsecure,
+						Alive:           true,
+					}
+
+					// Blocklist check
+					if blChecker != nil {
+						blResult := blChecker.Check(ctx, p.IP)
+						p.Blocklisted = blResult.Listed
+						p.Blocklists = blResult.BlocklistsString()
+						if p.Blocklisted {
+							logger.Debug("proxy on blocklist",
+								"ip", p.IP,
+								"port", p.Port,
+								"blocklists", p.Blocklists,
+							)
+						}
 					}
 
 					if err := db.UpsertProxy(p); err != nil {
@@ -314,4 +342,16 @@ func envOrDefaultInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envOrDefaultBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -10,28 +11,20 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
-// CheckerConfig holds configuration for the proxy checker.
+var ipRegex = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
+
 type CheckerConfig struct {
-	// Timeout is the maximum time to wait for a proxy check.
-	Timeout time.Duration
-
-	// TestURL is the URL to request through the proxy to validate it.
-	// Should return the requesting IP in the response body.
-	TestURL string
-
-	// OriginIP is the scanner's own IP address, used for anonymity detection.
-	// If empty, anonymity detection is skipped.
+	Timeout  time.Duration
+	TestURL  string
 	OriginIP string
-
-	// Logger for structured logging.
-	Logger *slog.Logger
+	Logger   *slog.Logger
 }
 
-// DefaultConfig returns a CheckerConfig with sensible defaults.
 func DefaultConfig() CheckerConfig {
 	return CheckerConfig{
 		Timeout: 10 * time.Second,
@@ -40,22 +33,17 @@ func DefaultConfig() CheckerConfig {
 	}
 }
 
-// Checker validates proxy candidates.
 type Checker struct {
 	cfg CheckerConfig
 }
 
-// NewChecker creates a new Checker with the given config.
 func NewChecker(cfg CheckerConfig) *Checker {
 	return &Checker{cfg: cfg}
 }
 
-// Check tests a candidate across all proxy protocols and returns results
-// for each protocol that works. Returns nil results if nothing works.
 func (c *Checker) Check(ctx context.Context, candidate Candidate) []CheckResult {
 	var results []CheckResult
 
-	// Try each protocol. A single IP:port may support multiple protocols.
 	protocols := []struct {
 		proto Protocol
 		check func(ctx context.Context, candidate Candidate) *CheckResult
@@ -76,19 +64,16 @@ func (c *Checker) Check(ctx context.Context, candidate Candidate) []CheckResult 
 	return results
 }
 
-// checkHTTP tests if the candidate works as an HTTP proxy.
 func (c *Checker) checkHTTP(ctx context.Context, candidate Candidate) *CheckResult {
 	proxyURL := fmt.Sprintf("http://%s:%d", candidate.IP, candidate.Port)
 	return c.checkHTTPProxy(ctx, candidate, proxyURL, ProtocolHTTP)
 }
 
-// checkHTTPS tests if the candidate works as an HTTPS (CONNECT) proxy.
 func (c *Checker) checkHTTPS(ctx context.Context, candidate Candidate) *CheckResult {
 	proxyURL := fmt.Sprintf("http://%s:%d", candidate.IP, candidate.Port)
 	return c.checkHTTPProxy(ctx, candidate, proxyURL, ProtocolHTTPS)
 }
 
-// checkHTTPProxy performs the actual HTTP/HTTPS proxy check.
 func (c *Checker) checkHTTPProxy(ctx context.Context, candidate Candidate, proxyURL string, proto Protocol) *CheckResult {
 	result := &CheckResult{
 		Candidate: candidate,
@@ -104,7 +89,6 @@ func (c *Checker) checkHTTPProxy(ctx context.Context, candidate Candidate, proxy
 
 	testURL := c.cfg.TestURL
 	if proto == ProtocolHTTPS {
-		// For HTTPS proxy test, use an HTTPS target to force CONNECT tunnel
 		testURL = strings.Replace(testURL, "http://", "https://", 1)
 	}
 
@@ -114,7 +98,42 @@ func (c *Checker) checkHTTPProxy(ctx context.Context, candidate Candidate, proxy
 			Timeout: c.cfg.Timeout,
 		}).DialContext,
 		TLSHandshakeTimeout: c.cfg.Timeout,
-		DisableKeepAlives:   true,
+		DisableKeepAlives:    true,
+	}
+
+	if proto == ProtocolHTTPS {
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: c.cfg.Timeout}
+			rawConn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, _ := net.SplitHostPort(addr)
+			tlsConn := tls.Client(rawConn, &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         host,
+			})
+			if err := tlsConn.Handshake(); err != nil {
+				rawConn.Close()
+				return nil, err
+			}
+			state := tlsConn.ConnectionState()
+			verified := len(state.VerifiedChains) > 0
+			if !verified {
+				result.TLSInsecure = true
+			} else {
+				for _, chain := range state.VerifiedChains {
+					for _, cert := range chain {
+						if cert.VerifyHostname(host) != nil {
+							result.TLSInsecure = true
+						}
+					}
+				}
+			}
+			return tlsConn, nil
+		}
+	} else {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
 	client := &http.Client{
@@ -142,7 +161,6 @@ func (c *Checker) checkHTTPProxy(ctx context.Context, candidate Candidate, proxy
 	}
 	defer resp.Body.Close()
 
-	// Read body (limited to 4KB — we only need the IP)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		result.Error = fmt.Errorf("reading response: %w", err)
@@ -156,12 +174,53 @@ func (c *Checker) checkHTTPProxy(ctx context.Context, candidate Candidate, proxy
 
 	result.Alive = true
 	result.LatencyMs = int(latency.Milliseconds())
+	result.ExitIP = extractIP(string(body))
 	result.Anonymity = c.detectAnonymity(resp.Header, string(body))
+
+	if proto == ProtocolHTTP {
+		result.SupportsConnect = c.checkConnectMethod(ctx, candidate)
+	}
 
 	return result
 }
 
-// checkSOCKS5 tests if the candidate works as a SOCKS5 proxy.
+func (c *Checker) checkConnectMethod(ctx context.Context, candidate Candidate) bool {
+	proxyAddr := fmt.Sprintf("%s:%d", candidate.IP, candidate.Port)
+	testHost := extractHostFromURL(c.cfg.TestURL)
+	_, port, err := net.SplitHostPort(testHost)
+	if err != nil {
+		port = "80"
+	}
+	host := strings.TrimSuffix(testHost, ":"+port)
+
+	connectReq := fmt.Sprintf("CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\n\r\n", host, port, host, port)
+
+	dialer := &net.Dialer{Timeout: c.cfg.Timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	deadline, ok := ctx.Deadline()
+	if ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		return false
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(line, "200")
+}
+
 func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckResult {
 	result := &CheckResult{
 		Candidate: candidate,
@@ -181,7 +240,6 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 
 	start := time.Now()
 
-	// Connect to the SOCKS5 proxy
 	dialer := &net.Dialer{Timeout: c.cfg.Timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
@@ -195,14 +253,11 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 		conn.SetDeadline(deadline)
 	}
 
-	// SOCKS5 handshake
-	// Send greeting: version 5, 1 auth method (no auth)
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		result.Error = fmt.Errorf("socks5 greeting: %w", err)
 		return result
 	}
 
-	// Read server choice
 	greeting := make([]byte, 2)
 	if _, err := io.ReadFull(conn, greeting); err != nil {
 		result.Error = fmt.Errorf("socks5 greeting response: %w", err)
@@ -213,8 +268,6 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 		return result
 	}
 
-	// Send connect request
-	// Version(1) + CMD_CONNECT(1) + RSV(1) + ATYP_DOMAIN(1) + domain_len(1) + domain + port(2)
 	host, port := splitHostPort(targetHost, 80)
 	connectReq := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
 	connectReq = append(connectReq, []byte(host)...)
@@ -227,7 +280,6 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 		return result
 	}
 
-	// Read connect response (at least 4 bytes for header)
 	connectResp := make([]byte, 4)
 	if _, err := io.ReadFull(conn, connectResp); err != nil {
 		result.Error = fmt.Errorf("socks5 connect response: %w", err)
@@ -238,29 +290,26 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 		return result
 	}
 
-	// Read the rest of the response based on address type
 	switch connectResp[3] {
-	case 0x01: // IPv4
-		discard := make([]byte, 4+2) // 4 bytes IP + 2 bytes port
+	case 0x01:
+		discard := make([]byte, 4+2)
 		io.ReadFull(conn, discard)
-	case 0x03: // Domain
+	case 0x03:
 		lenBuf := make([]byte, 1)
 		io.ReadFull(conn, lenBuf)
 		discard := make([]byte, int(lenBuf[0])+2)
 		io.ReadFull(conn, discard)
-	case 0x04: // IPv6
+	case 0x04:
 		discard := make([]byte, 16+2)
 		io.ReadFull(conn, discard)
 	}
 
-	// Now we have a tunnel — send HTTP request through it
 	httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; proxy-check/1.0)\r\nConnection: close\r\n\r\n", host)
 	if _, err := conn.Write([]byte(httpReq)); err != nil {
 		result.Error = fmt.Errorf("socks5 http request: %w", err)
 		return result
 	}
 
-	// Read HTTP response
 	reader := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
@@ -281,11 +330,11 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 	result.Alive = true
 	result.LatencyMs = int(latency.Milliseconds())
 	result.Anonymity = c.detectAnonymity(resp.Header, string(body))
+	result.ExitIP = extractIP(string(body))
 
 	return result
 }
 
-// checkSOCKS4 tests if the candidate works as a SOCKS4 proxy.
 func (c *Checker) checkSOCKS4(ctx context.Context, candidate Candidate) *CheckResult {
 	result := &CheckResult{
 		Candidate: candidate,
@@ -318,7 +367,6 @@ func (c *Checker) checkSOCKS4(ctx context.Context, candidate Candidate) *CheckRe
 		conn.SetDeadline(deadline)
 	}
 
-	// Resolve target host to IP (SOCKS4 requires IP, not domain)
 	host, port := splitHostPort(targetHost, 80)
 	ips, err := net.LookupHost(host)
 	if err != nil || len(ips) == 0 {
@@ -331,33 +379,28 @@ func (c *Checker) checkSOCKS4(ctx context.Context, candidate Candidate) *CheckRe
 		return result
 	}
 
-	// SOCKS4 connect request:
-	// VN(1) + CD(1) + DSTPORT(2) + DSTIP(4) + USERID + NULL(1)
 	connectReq := []byte{0x04, 0x01}
 	portBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBytes, uint16(port))
 	connectReq = append(connectReq, portBytes...)
 	connectReq = append(connectReq, targetIP...)
-	connectReq = append(connectReq, 0x00) // null-terminated user ID
+	connectReq = append(connectReq, 0x00)
 
 	if _, err := conn.Write(connectReq); err != nil {
 		result.Error = fmt.Errorf("socks4 connect: %w", err)
 		return result
 	}
 
-	// Read response (8 bytes)
 	resp4 := make([]byte, 8)
 	if _, err := io.ReadFull(conn, resp4); err != nil {
 		result.Error = fmt.Errorf("socks4 response: %w", err)
 		return result
 	}
-	// resp4[1] should be 0x5A for success
 	if resp4[1] != 0x5A {
 		result.Error = fmt.Errorf("socks4: connect failed with code 0x%02X", resp4[1])
 		return result
 	}
 
-	// Send HTTP request through tunnel
 	httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; proxy-check/1.0)\r\nConnection: close\r\n\r\n", host)
 	if _, err := conn.Write([]byte(httpReq)); err != nil {
 		result.Error = fmt.Errorf("socks4 http request: %w", err)
@@ -384,21 +427,18 @@ func (c *Checker) checkSOCKS4(ctx context.Context, candidate Candidate) *CheckRe
 	result.Alive = true
 	result.LatencyMs = int(latency.Milliseconds())
 	result.Anonymity = c.detectAnonymity(resp.Header, string(body))
+	result.ExitIP = extractIP(string(body))
 
 	return result
 }
 
-// detectAnonymity determines the anonymity level based on headers and response body.
 func (c *Checker) detectAnonymity(headers http.Header, body string) Anonymity {
 	if c.cfg.OriginIP == "" {
-		// Can't detect without knowing our own IP
 		return AnonymityAnonymous
 	}
 
-	// Check if our origin IP appears in the response body
 	originInBody := strings.Contains(body, c.cfg.OriginIP)
 
-	// Check proxy-revealing headers
 	proxyHeaders := []string{
 		"X-Forwarded-For",
 		"X-Real-IP",
@@ -428,7 +468,11 @@ func (c *Checker) detectAnonymity(headers http.Header, body string) Anonymity {
 	return AnonymityElite
 }
 
-// extractHost extracts the host:port from a URL string.
+func extractIP(body string) string {
+	match := ipRegex.FindString(body)
+	return match
+}
+
 func extractHost(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -446,7 +490,14 @@ func extractHost(rawURL string) string {
 	return net.JoinHostPort(host, port)
 }
 
-// splitHostPort splits a host:port string, returning defaults for missing port.
+func extractHostFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
 func splitHostPort(hostport string, defaultPort int) (string, int) {
 	host, portStr, err := net.SplitHostPort(hostport)
 	if err != nil {

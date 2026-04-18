@@ -46,6 +46,7 @@ services:
       WORKERS: "500"
       TIMEOUT: "10"
       TEST_URL: "http://httpbin.org/ip"
+      # SKIP_BLOCKLIST: "true"  # uncomment to disable DNSBL checking
 
 volumes:
   scanner-data:

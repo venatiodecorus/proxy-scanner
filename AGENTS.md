@@ -9,7 +9,7 @@ This is a Go monorepo that produces three container images for an open proxy sca
 Three components, three container images:
 
 1. **Scanner** (`docker/Dockerfile.scanner`) — Alpine + masscan. Runs as a K8s CronJob. Scans IPv4 space for open proxy ports. Outputs JSON to a shared PVC.
-2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs as a K8s Job after the scanner. Reads masscan output, validates each candidate as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, tags with GeoIP. Writes to SQLite on the shared PVC.
+2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs as a K8s Job after the scanner. Reads masscan output, validates each candidate as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Writes to SQLite on the shared PVC.
 3. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs as a K8s Deployment. Serves proxy data from SQLite. Internal ClusterIP service for other cluster workloads.
 
 ## Code Structure
@@ -18,6 +18,7 @@ Three components, three container images:
 cmd/validator/main.go    — Validator entry point (worker pool, egress IP detection)
 cmd/api/main.go          — API entry point (REST endpoints, request logging)
 internal/proxy/          — Proxy checking logic (checker.go, geoip.go, types.go)
+internal/blocklist/      — DNSBL blocklist checking (dnsbl.go)
 internal/database/       — SQLite operations (sqlite.go)
 internal/scanner/        — Masscan output parser (parser.go)
 data/                    — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
@@ -57,6 +58,7 @@ deploy/                  — Example Kubernetes manifests (reference only)
 - `WORKERS` — Number of concurrent validation goroutines (default: `500`)
 - `TIMEOUT` — Per-proxy validation timeout in seconds (default: `10`)
 - `TEST_URL` — URL to request through the proxy for validation (default: `http://httpbin.org/ip`)
+- `SKIP_BLOCKLIST` — Set to `true` to disable DNSBL blocklist checking (default: `false`)
 
 ### API (`cmd/api`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
@@ -70,7 +72,8 @@ deploy/                  — Example Kubernetes manifests (reference only)
 - No global state. Pass dependencies explicitly.
 - Database operations go through the `database.DB` struct, not raw SQL in business logic.
 - Proxy checking logic is in `internal/proxy/checker.go`. Each protocol has its own check function.
-- The validator orchestrates: parse input -> fan out to workers -> collect results -> write to DB.
+- Blocklist checking is in `internal/blocklist/dnsbl.go`. Uses DNSBL (DNS-based blocklists) to flag known-abuse IPs.
+- The validator orchestrates: parse input -> fan out to workers -> check proxy -> check blocklists -> write to DB.
 
 ## Testing
 
