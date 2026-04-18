@@ -28,5 +28,6 @@ jobs:
 
       - name: Build binaries
         run: |
+          CGO_ENABLED=1 go build ./cmd/scanner/
           CGO_ENABLED=1 go build ./cmd/validator/
           CGO_ENABLED=1 go build ./cmd/api/

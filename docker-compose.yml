@@ -30,6 +30,8 @@ services:
     environment:
       SCAN_RATE: "50000"
       SCAN_PORTS: "3128,8080,1080,8888,9050,8443,3129,80,443,1081"
+      SCAN_ADAPTER: "ens3"
+      DB_PATH: /data/proxies.db
       OUTPUT_FILE: /data/candidates.json
 
   validator:
@@ -39,7 +41,6 @@ services:
     volumes:
       - scanner-data:/data
     environment:
-      SCAN_INPUT: /data/candidates.json
       DB_PATH: /data/proxies.db
       GEOIP_CITY_DB: /geoip/GeoLite2-City.mmdb
       GEOIP_ASN_DB: /geoip/GeoLite2-ASN.mmdb
@@ -47,6 +48,7 @@ services:
       TIMEOUT: "10"
       TEST_URL: "http://httpbin.org/ip"
       # SKIP_BLOCKLIST: "true"  # uncomment to disable DNSBL checking
+      # BATCH_SIZE: "1000"      # candidates to dequeue per batch
 
 volumes:
   scanner-data:

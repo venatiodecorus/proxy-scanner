@@ -85,6 +85,19 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_proxies_latency ON proxies(alive, latency_ms);
 	CREATE INDEX IF NOT EXISTS idx_proxies_country ON proxies(alive, country);
 	CREATE INDEX IF NOT EXISTS idx_proxies_blocklisted ON proxies(alive, blocklisted);
+
+	CREATE TABLE IF NOT EXISTS candidates (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		ip         TEXT NOT NULL,
+		port       INTEGER NOT NULL,
+		status     TEXT NOT NULL DEFAULT 'pending',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(ip, port)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status);
+	CREATE INDEX IF NOT EXISTS idx_candidates_ip_port ON candidates(ip, port);
 	`
 	_, err := d.db.Exec(schema)
 	if err != nil {
@@ -163,6 +176,134 @@ func (d *DB) UpsertProxy(p *proxy.Proxy) error {
 		return fmt.Errorf("upserting proxy %s:%d: %w", p.IP, p.Port, err)
 	}
 	return nil
+}
+
+// EnqueueCandidates inserts candidates into the queue, skipping duplicates.
+// Returns the number of newly enqueued candidates.
+func (d *DB) EnqueueCandidates(candidates []proxy.Candidate) (int64, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO candidates (ip, port, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		return 0, fmt.Errorf("preparing insert: %w", err)
+	}
+	defer stmt.Close()
+
+	var enqueued int64
+	now := time.Now().UTC()
+	for _, c := range candidates {
+		result, err := stmt.Exec(c.IP, c.Port, proxy.CandidateStatusPending, now, now)
+		if err != nil {
+			return 0, fmt.Errorf("inserting candidate %s:%d: %w", c.IP, c.Port, err)
+		}
+		affected, _ := result.RowsAffected()
+		enqueued += affected
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return enqueued, nil
+}
+
+// DequeueCandidates claims up to `limit` pending candidates for processing.
+// It sets their status to 'processing' and returns them.
+func (d *DB) DequeueCandidates(limit int) ([]proxy.CandidateEntry, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT id, ip, port, status, created_at, updated_at FROM candidates WHERE status = ? ORDER BY id LIMIT ?", proxy.CandidateStatusPending, limit)
+	if err != nil {
+		return nil, fmt.Errorf("querying pending candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []proxy.CandidateEntry
+	var ids []int64
+	for rows.Next() {
+		var e proxy.CandidateEntry
+		if err := rows.Scan(&e.ID, &e.IP, &e.Port, &e.Status, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scanning candidate: %w", err)
+		}
+		entries = append(entries, e)
+		ids = append(ids, e.ID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating candidates: %w", err)
+	}
+
+	for i := range entries {
+		entries[i].Status = proxy.CandidateStatusProcessing
+		entries[i].UpdatedAt = time.Now().UTC()
+	}
+
+	if len(ids) > 0 {
+		placeholders := strings.Repeat("?,", len(ids))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]interface{}, len(ids))
+		for i, id := range ids {
+			args[i] = id
+		}
+		query := fmt.Sprintf("UPDATE candidates SET status = ?, updated_at = ? WHERE id IN (%s)", placeholders)
+		now := time.Now().UTC()
+		allArgs := append([]interface{}{proxy.CandidateStatusProcessing, now}, args...)
+		if _, err := tx.Exec(query, allArgs...); err != nil {
+			return nil, fmt.Errorf("updating candidates to processing: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return entries, nil
+}
+
+// DeleteCandidate removes a candidate from the queue after processing.
+func (d *DB) DeleteCandidate(id int64) error {
+	_, err := d.db.Exec("DELETE FROM candidates WHERE id = ?", id)
+	return err
+}
+
+// DeleteCandidates removes multiple candidates from the queue after processing.
+func (d *DB) DeleteCandidates(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	query := fmt.Sprintf("DELETE FROM candidates WHERE id IN (%s)", placeholders)
+	_, err := d.db.Exec(query, args...)
+	return err
+}
+
+// ResetProcessingCandidates resets all 'processing' candidates back to 'pending'.
+// Called on validator startup to recover from crashes.
+func (d *DB) ResetProcessingCandidates() (int64, error) {
+	result, err := d.db.Exec("UPDATE candidates SET status = ?, updated_at = ? WHERE status = ?", proxy.CandidateStatusPending, time.Now().UTC(), proxy.CandidateStatusProcessing)
+	if err != nil {
+		return 0, fmt.Errorf("resetting processing candidates: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// PendingCandidateCount returns the number of candidates waiting to be validated.
+func (d *DB) PendingCandidateCount() (int, error) {
+	var count int
+	err := d.db.QueryRow("SELECT COUNT(*) FROM candidates WHERE status = ?", proxy.CandidateStatusPending).Scan(&count)
+	return count, err
 }
 
 // MarkAllDead marks all currently alive proxies as dead. Called at the start

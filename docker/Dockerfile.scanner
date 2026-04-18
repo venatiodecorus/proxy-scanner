@@ -1,8 +1,24 @@
+# Build stage
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache gcc musl-dev
+
+WORKDIR /build
+
+# Cache dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Build
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /scanner ./cmd/scanner/
+
+# Runtime stage
 FROM alpine:3.20
 
-RUN apk add --no-cache masscan bash libpcap-dev
+RUN apk add --no-cache masscan bash libpcap-dev ca-certificates
 
-# Create data directory
+# Create data and config directories
 RUN mkdir -p /data /config
 
 # Copy all exclude list fragments and merge them at build time.
@@ -19,9 +35,8 @@ RUN cat /config/exclude.d/*.conf \
     && rm -rf /config/exclude.d/ \
     && echo "Exclude list entries: $(wc -l < /config/exclude.conf)"
 
-COPY docker/scan.sh /usr/local/bin/scan.sh
-RUN chmod +x /usr/local/bin/scan.sh
+COPY --from=builder /scanner /usr/local/bin/scanner
 
 VOLUME ["/data"]
 
-ENTRYPOINT ["/usr/local/bin/scan.sh"]
+ENTRYPOINT ["/usr/local/bin/scanner"]

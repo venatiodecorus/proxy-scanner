@@ -274,3 +274,263 @@ func TestStats(t *testing.T) {
 		t.Errorf("expected avg latency 150, got %d", stats.AvgLatencyMs)
 	}
 }
+
+func TestEnqueueCandidates(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+		{IP: "9.10.11.12", Port: 1080},
+	}
+
+	enqueued, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("enqueueing candidates: %v", err)
+	}
+	if enqueued != 3 {
+		t.Errorf("expected 3 enqueued, got %d", enqueued)
+	}
+
+	pending, err := db.PendingCandidateCount()
+	if err != nil {
+		t.Fatalf("getting pending count: %v", err)
+	}
+	if pending != 3 {
+		t.Errorf("expected 3 pending, got %d", pending)
+	}
+}
+
+func TestEnqueueCandidatesSkipsDuplicates(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+	}
+
+	enqueued, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	if enqueued != 2 {
+		t.Errorf("expected 2 enqueued on first call, got %d", enqueued)
+	}
+
+	enqueued, err = db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+	if enqueued != 0 {
+		t.Errorf("expected 0 enqueued on duplicate call, got %d", enqueued)
+	}
+
+	pending, err := db.PendingCandidateCount()
+	if err != nil {
+		t.Fatalf("getting pending count: %v", err)
+	}
+	if pending != 2 {
+		t.Errorf("expected 2 pending, got %d", pending)
+	}
+}
+
+func TestDequeueCandidates(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+		{IP: "9.10.11.12", Port: 1080},
+	}
+
+	_, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("enqueueing: %v", err)
+	}
+
+	entries, err := db.DequeueCandidates(2)
+	if err != nil {
+		t.Fatalf("dequeueing: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+
+	for i, e := range entries {
+		if e.Status != proxy.CandidateStatusProcessing {
+			t.Errorf("entry %d: expected status processing, got %s", i, e.Status)
+		}
+		if e.IP == "" || e.Port == 0 {
+			t.Errorf("entry %d: got empty IP or port", i)
+		}
+	}
+
+	pending, _ := db.PendingCandidateCount()
+	if pending != 1 {
+		t.Errorf("expected 1 remaining pending, got %d", pending)
+	}
+
+	entries2, err := db.DequeueCandidates(10)
+	if err != nil {
+		t.Fatalf("second dequeue: %v", err)
+	}
+	if len(entries2) != 1 {
+		t.Errorf("expected 1 entry on second dequeue, got %d", len(entries2))
+	}
+
+	entries3, err := db.DequeueCandidates(10)
+	if err != nil {
+		t.Fatalf("third dequeue: %v", err)
+	}
+	if len(entries3) != 0 {
+		t.Errorf("expected 0 entries on empty queue, got %d", len(entries3))
+	}
+}
+
+func TestDeleteCandidate(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+	}
+
+	_, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("enqueueing: %v", err)
+	}
+
+	entries, err := db.DequeueCandidates(1)
+	if err != nil {
+		t.Fatalf("dequeueing: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+
+	if err := db.DeleteCandidate(entries[0].ID); err != nil {
+		t.Fatalf("deleting candidate: %v", err)
+	}
+
+	pending, _ := db.PendingCandidateCount()
+	if pending != 1 {
+		t.Errorf("expected 1 remaining candidate, got %d", pending)
+	}
+}
+
+func TestDeleteCandidates(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+		{IP: "9.10.11.12", Port: 1080},
+	}
+
+	_, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("enqueueing: %v", err)
+	}
+
+	entries, err := db.DequeueCandidates(2)
+	if err != nil {
+		t.Fatalf("dequeueing: %v", err)
+	}
+
+	var ids []int64
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
+
+	if err := db.DeleteCandidates(ids); err != nil {
+		t.Fatalf("deleting candidates: %v", err)
+	}
+
+	pending, _ := db.PendingCandidateCount()
+	if pending != 1 {
+		t.Errorf("expected 1 remaining candidate, got %d", pending)
+	}
+}
+
+func TestResetProcessingCandidates(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+		{IP: "9.10.11.12", Port: 1080},
+	}
+
+	_, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("enqueueing: %v", err)
+	}
+
+	_, err = db.DequeueCandidates(2)
+	if err != nil {
+		t.Fatalf("dequeueing: %v", err)
+	}
+
+	pending, _ := db.PendingCandidateCount()
+	if pending != 1 {
+		t.Errorf("expected 1 pending before reset, got %d", pending)
+	}
+
+	reset, err := db.ResetProcessingCandidates()
+	if err != nil {
+		t.Fatalf("resetting: %v", err)
+	}
+	if reset != 2 {
+		t.Errorf("expected 2 reset, got %d", reset)
+	}
+
+	pending, _ = db.PendingCandidateCount()
+	if pending != 3 {
+		t.Errorf("expected 3 pending after reset, got %d", pending)
+	}
+}
+
+func TestCandidateQueueEndToEnd(t *testing.T) {
+	db := mustOpen(t)
+
+	candidates := []proxy.Candidate{
+		{IP: "1.2.3.4", Port: 8080},
+		{IP: "5.6.7.8", Port: 3128},
+		{IP: "9.10.11.12", Port: 1080},
+	}
+
+	enqueued, err := db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("enqueueing: %v", err)
+	}
+	if enqueued != 3 {
+		t.Errorf("expected 3 enqueued, got %d", enqueued)
+	}
+
+	entries, err := db.DequeueCandidates(10)
+	if err != nil {
+		t.Fatalf("dequeueing: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+
+	for _, entry := range entries {
+		if err := db.DeleteCandidate(entry.ID); err != nil {
+			t.Fatalf("deleting candidate %d: %v", entry.ID, err)
+		}
+	}
+
+	pending, _ := db.PendingCandidateCount()
+	if pending != 0 {
+		t.Errorf("expected 0 pending after processing, got %d", pending)
+	}
+
+	enqueued, err = db.EnqueueCandidates(candidates)
+	if err != nil {
+		t.Fatalf("re-enqueueing: %v", err)
+	}
+	if enqueued != 3 {
+		t.Errorf("expected 3 re-enqueued after deletion, got %d", enqueued)
+	}
+}

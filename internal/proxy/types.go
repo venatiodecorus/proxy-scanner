@@ -87,6 +87,23 @@ type ProxyFilter struct {
 	Offset     int       `json:"offset,omitempty"`
 }
 
+// CandidateEntry represents a candidate in the validation queue.
+// It tracks candidates from the scanner through the validation pipeline.
+type CandidateEntry struct {
+	ID        int64     `json:"id"`
+	IP        string    `json:"ip"`
+	Port      int       `json:"port"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// CandidateStatus constants for the validation queue.
+const (
+	CandidateStatusPending    = "pending"
+	CandidateStatusProcessing = "processing"
+)
+
 // Stats contains aggregate statistics about the proxy database.
 type Stats struct {
 	TotalProxies int            `json:"total_proxies"`

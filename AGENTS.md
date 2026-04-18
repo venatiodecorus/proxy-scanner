@@ -8,33 +8,35 @@ This is a Go monorepo that produces three container images for an open proxy sca
 
 Three components, three container images:
 
-1. **Scanner** (`docker/Dockerfile.scanner`) — Alpine + masscan. Runs on-demand via Docker Compose scan profile. Scans IPv4 space for open proxy ports. Outputs JSON to a shared volume.
-2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs on-demand via Docker Compose scan profile after the scanner. Reads masscan output, validates each candidate as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Writes to SQLite on the shared volume.
+1. **Scanner** (`cmd/scanner/`, `docker/Dockerfile.scanner`) — Go binary wrapping masscan. Runs on-demand via Docker Compose scan profile. Scans IPv4 space for open proxy ports, then enqueues candidates into the SQLite database. The Scanner writes masscan JSON output to disk (for debugging) but the primary data path is the `candidates` queue table in SQLite.
+2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs on-demand via Docker Compose scan profile. Reads candidates from the `candidates` queue table, validates each as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Validated proxies are upserted into the `proxies` table; processed candidates are deleted from the queue. On startup, resets any `processing` candidates back to `pending` for crash recovery.
 3. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs continuously. Serves proxy data from SQLite at `http://localhost:8080/v1/`.
 
-Scanner and validator use the `scan` profile in `docker-compose.yml` and are run on-demand. The API runs continuously by default.
+All three components share a SQLite database via a Docker named volume. The `candidates` table acts as a durable work queue — the Scanner enqueues, the Validator dequeues and processes. Candidates are removed from the queue after processing (whether validated or failed), so the Validator never reprocesses the same candidate.
 
 ## Code Structure
 
 ```
-cmd/validator/main.go    — Validator entry point (worker pool, egress IP detection)
-cmd/api/main.go          — API entry point (REST endpoints, request logging)
-internal/proxy/          — Proxy checking logic (checker.go, geoip.go, types.go)
-internal/blocklist/      — DNSBL blocklist checking (dnsbl.go)
-internal/database/       — SQLite operations (sqlite.go)
-internal/scanner/        — Masscan output parser (parser.go)
-data/                    — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
-config/exclude/          — Modular CIDR exclusion lists (merged at Docker build time)
-docker/                  — Dockerfiles + scan.sh for all three images
-docker-compose.yml       — Docker Compose configuration
-.github/workflows/       — CI (test on PR) and build+push (images to GHCR on main)
+cmd/scanner/main.go  — Scanner entry point (runs masscan, enqueues results to SQLite)
+cmd/validator/main.go — Validator entry point (dequeues candidates, validates, writes to proxies table)
+cmd/api/main.go      — API entry point (REST endpoints, request logging)
+internal/proxy/       — Proxy checking logic (checker.go, geoip.go, types.go)
+internal/blocklist/    — DNSBL blocklist checking (dnsbl.go)
+internal/database/    — SQLite operations (sqlite.go) — includes candidates queue
+internal/scanner/     — Masscan output parser (parser.go)
+data/                 — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
+config/exclude/       — Modular CIDR exclusion lists (merged at Docker build time)
+docker/               — Dockerfiles for all three images
+docker-compose.yml    — Docker Compose configuration
+.github/workflows/    — CI (test on PR) and build+push (images to GHCR on main)
 ```
 
 ## Key Technical Details
 
 - **Go module**: `github.com/venatiodecorus/proxy-scanner`
 - **Database**: SQLite with WAL mode. Single writer (validator), single reader (API). DB file at `/data/proxies.db`.
-- **Scan output**: Masscan JSON at `/data/candidates.json` on the shared volume.
+- **Candidates queue**: The `candidates` table in SQLite serves as a durable work queue. Scanner enqueues (INSERT OR IGNORE), Validator dequeues (SELECT pending → UPDATE to processing) and deletes after processing. On validator startup, any `processing` candidates are reset to `pending` for crash recovery.
+- **Scan output**: Masscan JSON at `/data/candidates.json` on the shared volume (debugging artifact). The primary data path is the SQLite queue.
 - **Container registry**: `ghcr.io/venatiodecorus/proxy-scanner-{scanner,validator,api}`
 - **GeoIP**: MaxMind GeoLite2-City + ASN databases bundled in the validator image at `/geoip/`. Source `.mmdb` files are committed in `data/`.
 - **Egress IP**: Validator auto-detects public IP at startup via external services (ipify, ifconfig.me, etc.). Override with `ORIGIN_IP` env var.
@@ -51,8 +53,15 @@ docker-compose.yml       — Docker Compose configuration
 
 ## Environment Variables
 
+### Scanner (`cmd/scanner`)
+- `SCAN_RATE` — Masscan packets per second (default: `50000`)
+- `SCAN_PORTS` — Comma-separated port list (default: `3128,8080,1080,8888,9050,8443,3129,80,443,1081`)
+- `SCAN_ADAPTER` — Network interface for masscan (default: `ens3`)
+- `EXCLUDE_FILE` — Path to CIDR exclusion file (default: `/config/exclude.conf`)
+- `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
+- `OUTPUT_FILE` — Path for masscan JSON output (default: `/data/candidates.json`)
+
 ### Validator (`cmd/validator`)
-- `SCAN_INPUT` — Path to masscan JSON output (default: `/data/candidates.json`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
 - `GEOIP_CITY_DB` — Path to MaxMind GeoLite2-City database (default: `/geoip/GeoLite2-City.mmdb`)
 - `GEOIP_ASN_DB` — Path to MaxMind GeoLite2-ASN database (default: `/geoip/GeoLite2-ASN.mmdb`)
@@ -61,6 +70,7 @@ docker-compose.yml       — Docker Compose configuration
 - `TIMEOUT` — Per-proxy validation timeout in seconds (default: `10`)
 - `TEST_URL` — URL to request through the proxy for validation (default: `http://httpbin.org/ip`)
 - `SKIP_BLOCKLIST` — Set to `true` to disable DNSBL blocklist checking (default: `false`)
+- `BATCH_SIZE` — Number of candidates to dequeue per batch (default: `1000`)
 
 ### API (`cmd/api`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
@@ -101,7 +111,9 @@ Files are numbered so they merge in predictable order via `cat config/exclude/*.
 ## Deployment Notes
 
 - Run the API continuously: `docker compose up -d api`
-- Run a scan: `docker compose --profile scan up scanner validator`
+- Run a scan: `docker compose --profile scan up scanner`
+- Run the validator: `docker compose --profile scan up validator`
+- The scanner and validator can be run independently. The scanner enqueues candidates to SQLite; the validator dequeues and processes them.
 - The three components share a named Docker volume `scanner-data` mounted at `/data`.
 - SQLite WAL mode allows concurrent reads (API) while the validator writes.
 - Rate limit masscan to 50k pps to avoid abuse complaints.
