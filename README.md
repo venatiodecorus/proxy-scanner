@@ -89,7 +89,8 @@ sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_dat
 # Watch validated proxy count
 sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/proxies.db "SELECT COUNT(*) FROM proxies WHERE alive = 1"'
 
-# Follow container logs
+# Watch live scan progress (masscan writes to JSON as it scans)
+sudo watch -n 5 'wc -l /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/candidates.json'
 docker logs -f proxy-scanner-scanner
 docker logs -f proxy-scanner-validator
 ```
