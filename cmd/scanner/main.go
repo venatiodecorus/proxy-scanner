@@ -77,6 +77,15 @@ func run(logger *slog.Logger) error {
 	cmd.Stderr = os.Stderr
 	cmd.Dir = "/data"
 
+	// Capture the pre-run mtime of the output file so we can detect whether
+	// masscan produced any new output in this run. This lets us skip parsing
+	// stale output from a prior run if masscan fails immediately (e.g. on a
+	// failed --resume).
+	var preRunMtime time.Time
+	if st, err := os.Stat(outputFile); err == nil {
+		preRunMtime = st.ModTime()
+	}
+
 	logger.Info("running masscan",
 		"started", time.Now().UTC().Format(time.RFC3339),
 		"resuming", resuming,
@@ -106,6 +115,13 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			if resuming {
 				logger.Warn("masscan exited with error after resume; resume file preserved for next attempt", "error", err)
+				// If masscan failed immediately on resume without producing new
+				// output, skip parsing to avoid re-enqueueing stale candidates
+				// from a prior run's output file.
+				if !outputFileIsFresh(outputFile, preRunMtime) {
+					logger.Info("resume failed with no new scan output; skipping parse")
+					return nil
+				}
 				return parseAndEnqueue(logger, db, outputFile)
 			}
 			return fmt.Errorf("masscan failed: %w", err)
@@ -141,6 +157,20 @@ func run(logger *slog.Logger) error {
 	}
 
 	return parseAndEnqueue(logger, db, outputFile)
+}
+
+// outputFileIsFresh reports whether outputFile has been modified since
+// preRunMtime. A zero preRunMtime means the file did not exist before the
+// run, so any existing file now is considered fresh.
+func outputFileIsFresh(outputFile string, preRunMtime time.Time) bool {
+	st, err := os.Stat(outputFile)
+	if err != nil {
+		return false
+	}
+	if preRunMtime.IsZero() {
+		return true
+	}
+	return st.ModTime().After(preRunMtime)
 }
 
 func parseAndEnqueue(logger *slog.Logger, db *database.DB, outputFile string) error {
