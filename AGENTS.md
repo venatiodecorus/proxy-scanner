@@ -37,6 +37,7 @@ docker-compose.yml    — Docker Compose configuration
 - **Database**: SQLite with WAL mode. Single writer (validator), single reader (API). DB file at `/data/proxies.db`.
 - **Candidates queue**: The `candidates` table in SQLite serves as a durable work queue. Scanner enqueues (INSERT OR IGNORE), Validator dequeues (SELECT pending → UPDATE to processing) and deletes after processing. On validator startup, any `processing` candidates are reset to `pending` for crash recovery.
 - **Scan output**: Masscan JSON at `/data/candidates.json` on the shared volume (debugging artifact). The primary data path is the SQLite queue.
+- **Scan resume**: The scanner supports masscan's `--resume` feature for incremental scanning. When `SCAN_TIMEOUT` is set, the scanner sends SIGINT to masscan after the timeout, causing masscan to save its state to `/data/paused.conf`. On the next run, the scanner detects this file and resumes from where it left off. This allows weekly scan sessions that make incremental progress through the entire IPv4 space without re-scanning previously covered ranges.
 - **Container registry**: `ghcr.io/venatiodecorus/proxy-scanner-{scanner,validator,api}`
 - **GeoIP**: MaxMind GeoLite2-City + ASN databases bundled in the validator image at `/geoip/`. Source `.mmdb` files are committed in `data/`.
 - **Egress IP**: Validator auto-detects public IP at startup via external services (ipify, ifconfig.me, etc.). Override with `ORIGIN_IP` env var.
@@ -60,6 +61,8 @@ docker-compose.yml    — Docker Compose configuration
 - `EXCLUDE_FILE` — Path to CIDR exclusion file (default: `/config/exclude.conf`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
 - `OUTPUT_FILE` — Path for masscan JSON output (default: `/data/candidates.json`)
+- `RESUME_FILE` — Path for masscan resume state file (default: `/data/paused.conf`). If this file exists at startup, the scanner resumes the previous scan from this state.
+- `SCAN_TIMEOUT` — Maximum duration for a scan session (e.g. `4h`, `30m`). When set, sends SIGINT to masscan after this duration, causing it to save state to `RESUME_FILE` for next run. Unset by default (scan runs to completion). Enables incremental weekly scanning.
 
 ### Validator (`cmd/validator`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
@@ -114,6 +117,7 @@ Files are numbered so they merge in predictable order via `cat config/exclude/*.
 - Run a scan: `docker compose --profile scan up scanner`
 - Run the validator: `docker compose --profile scan up validator`
 - The scanner and validator can be run independently. The scanner enqueues candidates to SQLite; the validator dequeues and processes them.
+- For incremental weekly scanning: Set `SCAN_TIMEOUT` (e.g. `4h`) so masscan saves state on timeout. Next run resumes automatically via `/data/paused.conf`.
 - The three components share a named Docker volume `scanner-data` mounted at `/data`.
 - SQLite WAL mode allows concurrent reads (API) while the validator writes.
 - Rate limit masscan to 50k pps to avoid abuse complaints.

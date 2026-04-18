@@ -33,6 +33,8 @@ services:
       SCAN_ADAPTER: "ens3"
       DB_PATH: /data/proxies.db
       OUTPUT_FILE: /data/candidates.json
+      RESUME_FILE: /data/paused.conf
+      # SCAN_TIMEOUT: "4h"    # limit per-session scan time; sends SIGINT to masscan for graceful resume
 
   validator:
     image: ghcr.io/venatiodecorus/proxy-scanner-validator:latest
