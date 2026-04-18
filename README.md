@@ -66,6 +66,34 @@ docker compose --profile scan up scanner
 
 Masscan randomizes scan order by default, so resumed scans won't re-scan previously covered segments.
 
+## Stopping and Resuming
+
+### Graceful stop (saves scan progress)
+
+To stop the scanner mid-scan without losing progress, send SIGINT — masscan saves its state to `paused.conf` and the Go scanner parses any results already written:
+
+```bash
+docker kill --signal=SIGINT proxy-scanner-scanner
+```
+
+Do **not** use `docker stop` or `docker compose down` — these send SIGTERM, which kills masscan before it can save resume state.
+
+The validator can be stopped anytime with `docker compose --profile scan down validator`. It resets any in-progress candidates back to `pending` on next startup, so no work is lost.
+
+### Monitoring progress
+
+```bash
+# Watch candidate count in the queue
+sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/proxies.db "SELECT status, COUNT(*) FROM candidates GROUP BY status"'
+
+# Watch validated proxy count
+sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/proxies.db "SELECT COUNT(*) FROM proxies WHERE alive = 1"'
+
+# Follow container logs
+docker logs -f proxy-scanner-scanner
+docker logs -f proxy-scanner-validator
+```
+
 ## Monitoring Bandwidth
 
 If your VPS has limited bandwidth, install **vnstat** on the host to track usage across all containers:
