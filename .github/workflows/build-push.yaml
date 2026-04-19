@@ -146,8 +146,46 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  build-revalidator:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-revalidator
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push revalidator
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.revalidator
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy:
-    needs: [build-scanner, build-validator, build-api]
+    needs: [build-scanner, build-validator, build-api, build-revalidator]
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
@@ -160,5 +198,5 @@ jobs:
           script: |
             cd /opt/proxy-scanner
             docker compose pull
-            docker compose up -d api
+            docker compose up -d api revalidator
             docker image prune -f

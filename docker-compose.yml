@@ -52,5 +52,29 @@ services:
       # SKIP_BLOCKLIST: "true"  # uncomment to disable DNSBL checking
       # BATCH_SIZE: "1000"      # candidates to dequeue per batch
 
+  # Long-running service that periodically rechecks validated proxies and
+  # evicts ones that have been failing for too long. Runs alongside the API
+  # by default (no profile required).
+  revalidator:
+    image: ghcr.io/venatiodecorus/proxy-scanner-revalidator:latest
+    container_name: proxy-scanner-revalidator
+    restart: unless-stopped
+    volumes:
+      - scanner-data:/data
+    environment:
+      DB_PATH: /data/proxies.db
+      GEOIP_CITY_DB: /geoip/GeoLite2-City.mmdb
+      GEOIP_ASN_DB: /geoip/GeoLite2-ASN.mmdb
+      WORKERS: "100"
+      TIMEOUT: "10"
+      TEST_URL: "http://httpbin.org/ip"
+      BATCH_SIZE: "500"
+      RECHECK_INTERVAL: "1h"      # don't recheck a proxy more often than this
+      IDLE_SLEEP: "60s"           # sleep when nothing is due
+      FAILURE_THRESHOLD: "3"      # consecutive fails before marking 'stale'
+      EVICT_AFTER: "168h"         # delete stale proxies after 7 days w/o success
+      EVICT_INTERVAL: "1h"        # how often to run the eviction sweep
+      # SKIP_BLOCKLIST: "true"    # uncomment to skip DNSBL on rechecks
+
 volumes:
   scanner-data:
