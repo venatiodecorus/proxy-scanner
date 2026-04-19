@@ -7,43 +7,52 @@ Deployed via Docker Compose.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  Docker Compose                          │
-│                                                         │
-│  ┌──────────────┐    on-demand (scan profile)           │
-│  │  scanner     │──→ masscan sweep of IPv4 space        │
-│  │  (Go+masscan)│    enqueues candidates to SQLite      │
-│  └──────┬───────┘                                       │
-│         │ candidates table (SQLite queue)                │
-│         ▼                                               │
-│  ┌──────────────┐    on-demand (scan profile)           │
-│  │  validator   │──→ Go: dequeues candidates, validates │
+┌──────────────────────────────────────────────────────────┐
+│                   Docker Compose                          │
+│                                                          │
+│  ┌──────────────┐    on-demand (scan profile)            │
+│  │  scanner     │──→ masscan sweep of IPv4 space         │
+│  │  (Go+masscan)│    enqueues candidates to SQLite       │
+│  └──────┬───────┘                                        │
+│         │ candidates table (SQLite queue)                 │
+│         ▼                                                │
+│  ┌──────────────┐    on-demand (scan profile)            │
+│  │  validator   │──→ Go: dequeues candidates, validates  │
 │  │  (Go)        │    proxies, GeoIP/ASN tagging          │
-│  └──────┬───────┘                                       │
-│         │ SQLite                                        │
-│         ▼                                               │
+│  └──────┬───────┘                                        │
+│         │ proxies table (SQLite)                         │
+│         ▼                                                │
 │  ┌──────────────┐    always running                      │
-│  │  api         │──→ REST API for proxy data            │
-│  │  (Go)        │    http://localhost:8080/v1/          │
-│  └──────────────┘                                       │
-└─────────────────────────────────────────────────────────┘
+│  │  revalidator │──→ Go: rechecks proxies, marks stale,  │
+│  │  (Go)        │    evicts after grace period           │
+│  └──────┬───────┘                                        │
+│         │ SQLite                                         │
+│         ▼                                                │
+│  ┌──────────────┐    always running                      │
+│  │  api         │──→ REST API for proxy data             │
+│  │  (Go)        │    http://localhost:8080/v1/           │
+│  └──────────────┘                                        │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Three components, three container images:
+Four components, four container images:
 
 | Component | Image | Purpose |
 |-----------|-------|---------|
 | Scanner | `ghcr.io/venatiodecorus/proxy-scanner-scanner` | Masscan sweep → SQLite queue |
 | Validator | `ghcr.io/venatiodecorus/proxy-scanner-validator` | Dequeue candidates, validate proxies, write to `proxies` table |
+| Revalidator | `ghcr.io/venatiodecorus/proxy-scanner-revalidator` | Periodically rechecks live proxies, demotes failing ones to `stale`, evicts dead ones |
 | API | `ghcr.io/venatiodecorus/proxy-scanner-api` | REST API serving proxy data from SQLite |
 
 The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates; the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
 
+The revalidator runs continuously alongside the API and rechecks the `proxies` table on a configurable interval (default 1h). Proxies that fail `FAILURE_THRESHOLD` consecutive checks (default 3) are marked `stale` (hidden from the API by default); proxies that stay stale for `EVICT_AFTER` (default 7 days) without a successful recheck are deleted.
+
 ## Quick Start
 
 ```bash
-# Pull images and start the API
-docker compose up -d api
+# Pull images and start the API + revalidator
+docker compose up -d api revalidator
 
 # Run a scan (scanner enqueues to SQLite)
 docker compose --profile scan up scanner
@@ -86,8 +95,8 @@ The validator can be stopped anytime with `docker compose --profile scan down va
 # Watch candidate count in the queue
 sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/proxies.db "SELECT status, COUNT(*) FROM candidates GROUP BY status"'
 
-# Watch validated proxy count
-sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/proxies.db "SELECT COUNT(*) FROM proxies WHERE alive = 1"'
+# Watch active validated proxy count
+sudo watch -n 5 'sqlite3 /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/proxies.db "SELECT status, COUNT(*) FROM proxies GROUP BY status"'
 
 # Watch live scan progress (masscan writes to JSON as it scans)
 sudo watch -n 5 'wc -l /var/lib/docker/volumes/proxy-scanner_scanner-data/_data/candidates.json'
@@ -135,7 +144,8 @@ Since the scanner uses `network_mode: host`, all container traffic flows through
 | `max_latency` | `500` | Maximum latency in ms |
 | `limit` | `50` | Results per page (default 100, max 1000) |
 | `offset` | `100` | Pagination offset |
-| `alive` | `false` | Include dead proxies (default: alive only) |
+| `status` | `active`, `stale`, `all` | Liveness filter (default: `active`). `stale` = recently failing but kept around; `all` = both. |
+| `alive` | `false` | Legacy alias for `status=all`. |
 
 ### Example Responses
 
@@ -210,6 +220,9 @@ docker build -f docker/Dockerfile.scanner -t proxy-scanner-scanner .
 # Validator
 docker build -f docker/Dockerfile.validator -t proxy-scanner-validator .
 
+# Revalidator
+docker build -f docker/Dockerfile.revalidator -t proxy-scanner-revalidator .
+
 # API
 docker build -f docker/Dockerfile.api -t proxy-scanner-api .
 ```
@@ -220,6 +233,7 @@ docker build -f docker/Dockerfile.api -t proxy-scanner-api .
 cmd/
   scanner/main.go            Entry point: masscan wrapper + SQLite queue
   validator/main.go          Entry point: dequeue, validate, write to proxies table
+  revalidator/main.go        Entry point: rechecks proxies, marks stale, evicts dead
   api/main.go                Entry point: REST API server
 internal/
   proxy/
@@ -246,6 +260,7 @@ config/
 docker/
   Dockerfile.scanner         Multi-stage Go build + masscan
   Dockerfile.validator       Multi-stage Go build + GeoIP databases
+  Dockerfile.revalidator     Multi-stage Go build + GeoIP databases
   Dockerfile.api             Multi-stage Go build
 docker-compose.yml           Docker Compose configuration
 .github/workflows/

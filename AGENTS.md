@@ -6,29 +6,33 @@ This is a Go monorepo that produces three container images for an open proxy sca
 
 ## Architecture
 
-Three components, three container images:
+Four components, four container images:
 
 1. **Scanner** (`cmd/scanner/`, `docker/Dockerfile.scanner`) — Go binary wrapping masscan. Runs on-demand via Docker Compose scan profile. Scans IPv4 space for open proxy ports, then enqueues candidates into the SQLite database. The Scanner writes masscan JSON output to disk (for debugging) but the primary data path is the `candidates` queue table in SQLite.
 2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs on-demand via Docker Compose scan profile. Reads candidates from the `candidates` queue table, validates each as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Validated proxies are upserted into the `proxies` table; processed candidates are deleted from the queue. On startup, resets any `processing` candidates back to `pending` for crash recovery.
-3. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs continuously. Serves proxy data from SQLite at `http://localhost:8080/v1/`.
+3. **Revalidator** (`cmd/revalidator/`, `docker/Dockerfile.revalidator`) — Go binary. Long-running, runs by default alongside the API. Periodically rechecks proxies in the `proxies` table to keep the live set fresh. Marks proxies `stale` after consecutive failures and evicts them after a grace period. Uses the same checker code as the Validator.
+4. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs continuously. Serves proxy data from SQLite at `http://localhost:8080/v1/`.
 
-All three components share a SQLite database via a Docker named volume. The `candidates` table acts as a durable work queue — the Scanner enqueues, the Validator dequeues and processes. Candidates are removed from the queue after processing (whether validated or failed), so the Validator never reprocesses the same candidate.
+All four components share a SQLite database via a Docker named volume. The `candidates` table acts as a durable work queue — the Scanner enqueues, the Validator dequeues and processes. Candidates are removed from the queue after processing (whether validated or failed), so the Validator never reprocesses the same candidate.
+
+The `proxies` table tracks per-row liveness via `status` (`active` or `stale`), `last_checked_at`, `last_ok_at`, `consecutive_failures`, `check_count`, and `success_count`. The Revalidator drives the lifecycle: successful rechecks reset failures and refresh latency; failures increment the counter; reaching the failure threshold flips a row to `stale` (hidden from API by default); rows that stay stale past the grace period get hard-deleted.
 
 ## Code Structure
 
 ```
-cmd/scanner/main.go  — Scanner entry point (runs masscan, enqueues results to SQLite)
-cmd/validator/main.go — Validator entry point (dequeues candidates, validates, writes to proxies table)
-cmd/api/main.go      — API entry point (REST endpoints, request logging)
-internal/proxy/       — Proxy checking logic (checker.go, geoip.go, types.go)
-internal/blocklist/    — DNSBL blocklist checking (dnsbl.go)
-internal/database/    — SQLite operations (sqlite.go) — includes candidates queue
-internal/scanner/     — Masscan output parser (parser.go)
-data/                 — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
-config/exclude/       — Modular CIDR exclusion lists (merged at Docker build time)
-docker/               — Dockerfiles for all three images
-docker-compose.yml    — Docker Compose configuration
-.github/workflows/    — CI (test on PR) and build+push (images to GHCR on main)
+cmd/scanner/main.go      — Scanner entry point (runs masscan, enqueues results to SQLite)
+cmd/validator/main.go    — Validator entry point (dequeues candidates, validates, writes to proxies table)
+cmd/revalidator/main.go  — Revalidator entry point (rechecks proxies, evicts dead ones)
+cmd/api/main.go          — API entry point (REST endpoints, request logging)
+internal/proxy/          — Proxy checking logic (checker.go, geoip.go, types.go)
+internal/blocklist/      — DNSBL blocklist checking (dnsbl.go)
+internal/database/       — SQLite operations (sqlite.go) — includes candidates queue + liveness tracking
+internal/scanner/        — Masscan output parser (parser.go)
+data/                    — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
+config/exclude/          — Modular CIDR exclusion lists (merged at Docker build time)
+docker/                  — Dockerfiles for all four images
+docker-compose.yml       — Docker Compose configuration
+.github/workflows/       — CI (test on PR) and build+push (images to GHCR on main)
 ```
 
 ## Key Technical Details
@@ -76,10 +80,27 @@ docker-compose.yml    — Docker Compose configuration
 - `SKIP_BLOCKLIST` — Set to `true` to disable DNSBL blocklist checking (default: `false`)
 - `BATCH_SIZE` — Number of candidates to dequeue per batch (default: `1000`)
 
+### Revalidator (`cmd/revalidator`)
+- `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
+- `GEOIP_CITY_DB` / `GEOIP_ASN_DB` — Path to MaxMind databases (defaults: `/geoip/...`)
+- `WORKERS` — Concurrent recheck goroutines (default: `100`, lower than validator since this is background work)
+- `TIMEOUT` — Per-check timeout in seconds (default: `10`)
+- `TEST_URL` — URL to request through the proxy (default: `http://httpbin.org/ip`)
+- `ORIGIN_IP` — Public IP for anonymity detection (default: auto-detected)
+- `SKIP_BLOCKLIST` — Disable DNSBL on rechecks (default: `false`)
+- `BATCH_SIZE` — Proxies pulled per recheck batch (default: `500`)
+- `RECHECK_INTERVAL` — Don't recheck a proxy more often than this (default: `1h`)
+- `IDLE_SLEEP` — Sleep duration when nothing is due for recheck (default: `60s`)
+- `FAILURE_THRESHOLD` — Consecutive failures before marking `stale` (default: `3`)
+- `EVICT_AFTER` — Delete stale proxies after this much time without success (default: `168h` / 7 days)
+- `EVICT_INTERVAL` — How often to run the eviction sweep (default: `1h`)
+
 ### API (`cmd/api`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
 - `LISTEN_ADDR` — Address to listen on (default: `:8080`)
 - `API_TOKEN` — Bearer token required for all endpoints except `/v1/health`. Auth is disabled when unset (default: unset/disabled)
+
+The API filters by proxy status. Default is `?status=active` (only proxies that passed their last recheck). Use `?status=stale` to see proxies in the failure-recovery grace period, or `?status=all` to see both. The legacy `?alive=false` parameter is treated as `?status=all`.
 
 ## Coding Conventions
 
@@ -114,11 +135,12 @@ Files are numbered so they merge in predictable order via `cat config/exclude/*.
 
 ## Deployment Notes
 
-- Run the API continuously: `docker compose up -d api`
+- Run the API and revalidator continuously: `docker compose up -d api revalidator`
 - Run a scan: `docker compose --profile scan up scanner`
 - Run the validator: `docker compose --profile scan up validator`
 - The scanner and validator can be run independently. The scanner enqueues candidates to SQLite; the validator dequeues and processes them.
+- The revalidator runs by default (no profile required) alongside the API. It rechecks existing proxies on `RECHECK_INTERVAL` (default 1h), demotes failing ones to `stale` after `FAILURE_THRESHOLD` consecutive failures, and hard-deletes them after `EVICT_AFTER` without a successful check.
 - For incremental weekly scanning: Set `SCAN_TIMEOUT` (e.g. `4h`) so masscan saves state on timeout. Next run resumes automatically via `/data/paused.conf`.
-- The three components share a named Docker volume `scanner-data` mounted at `/data`.
-- SQLite WAL mode allows concurrent reads (API) while the validator writes.
+- All four components share a named Docker volume `scanner-data` mounted at `/data`.
+- SQLite WAL mode allows concurrent reads (API) and writes from validator + revalidator. The single-writer constraint is handled by `_busy_timeout=5000` and per-process connections; transient `SQLITE_BUSY` retries are expected during heavy validator runs.
 - Rate limit masscan to 50k pps to avoid abuse complaints.
