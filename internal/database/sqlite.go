@@ -175,14 +175,16 @@ func (d *DB) migrate() error {
 	return nil
 }
 
-// UpsertProxy inserts or updates a proxy record. If the proxy already exists
-// (same ip, port, protocol), it updates the fields and treats this as a
-// successful check: status flips to active, consecutive_failures resets to 0,
-// and check/success counters increment.
+// UpsertProxy inserts or updates a proxy record. The upsert is always
+// treated as a successful check: status set to active, consecutive_failures
+// reset to 0, check_count and success_count incremented. The Alive field
+// on the input is honored on insert for backward compatibility but is
+// always coerced true on the update path (because the only production
+// caller, the candidate validator, only calls this for working proxies).
 //
-// This is the path used by the candidate validator for newly discovered proxies.
-// For background revalidation, the revalidator uses RecordCheckSuccess /
-// RecordCheckFailure directly so we don't have to round-trip the full struct.
+// For background revalidation, use RecordCheckSuccess / RecordCheckFailure
+// instead — those are the surfaces for "this proxy was/wasn't reachable on
+// this check" without round-tripping the full struct.
 func (d *DB) UpsertProxy(p *proxy.Proxy) error {
 	now := time.Now().UTC()
 	_, err := d.db.Exec(`
@@ -206,7 +208,7 @@ func (d *DB) UpsertProxy(p *proxy.Proxy) error {
 			blocklisted          = excluded.blocklisted,
 			blocklists           = excluded.blocklists,
 			last_seen            = excluded.last_seen,
-			alive                = excluded.alive,
+			alive                = TRUE,
 			last_checked_at      = excluded.last_checked_at,
 			last_ok_at           = excluded.last_ok_at,
 			consecutive_failures = 0,
@@ -505,8 +507,15 @@ func (d *DB) PendingCandidateCount() (int, error) {
 
 // MarkAllDead marks all currently alive proxies as dead. Called at the start
 // of a new validation run so only freshly validated proxies remain alive.
+//
+// Currently unused in production. Kept for tests and possible future use
+// (e.g. force a full revalidation cycle). Updates both the legacy alive
+// column and the status column to keep them coherent.
 func (d *DB) MarkAllDead() error {
-	_, err := d.db.Exec("UPDATE proxies SET alive = FALSE")
+	_, err := d.db.Exec(
+		"UPDATE proxies SET alive = FALSE, status = ? WHERE status = ?",
+		proxy.ProxyStatusStale, proxy.ProxyStatusActive,
+	)
 	return err
 }
 
@@ -590,13 +599,22 @@ func (d *DB) Stats() (*proxy.Stats, error) {
 		ByCountry:   make(map[string]int),
 	}
 
-	// Total and alive counts
+	// Counts. AliveProxies is kept as a legacy alias for ActiveProxies.
 	d.db.QueryRow("SELECT COUNT(*) FROM proxies").Scan(&s.TotalProxies)
-	d.db.QueryRow("SELECT COUNT(*) FROM proxies WHERE alive = TRUE").Scan(&s.AliveProxies)
-	d.db.QueryRow("SELECT COALESCE(AVG(latency_ms), 0) FROM proxies WHERE alive = TRUE").Scan(&s.AvgLatencyMs)
+	d.db.QueryRow("SELECT COUNT(*) FROM proxies WHERE status = ?", proxy.ProxyStatusActive).Scan(&s.ActiveProxies)
+	d.db.QueryRow("SELECT COUNT(*) FROM proxies WHERE status = ?", proxy.ProxyStatusStale).Scan(&s.StaleProxies)
+	s.AliveProxies = s.ActiveProxies
+	d.db.QueryRow("SELECT COALESCE(AVG(latency_ms), 0) FROM proxies WHERE status = ?", proxy.ProxyStatusActive).Scan(&s.AvgLatencyMs)
 
-	// By protocol
-	rows, err := d.db.Query("SELECT protocol, COUNT(*) FROM proxies WHERE alive = TRUE GROUP BY protocol")
+	// Recheck backlog: active proxies that haven't been checked in over an hour.
+	cutoff := time.Now().UTC().Add(-time.Hour)
+	d.db.QueryRow(
+		"SELECT COUNT(*) FROM proxies WHERE status = ? AND (last_checked_at IS NULL OR last_checked_at < ?)",
+		proxy.ProxyStatusActive, cutoff,
+	).Scan(&s.RecheckBacklog)
+
+	// By protocol (active only)
+	rows, err := d.db.Query("SELECT protocol, COUNT(*) FROM proxies WHERE status = ? GROUP BY protocol", proxy.ProxyStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("querying by protocol: %w", err)
 	}
@@ -610,8 +628,8 @@ func (d *DB) Stats() (*proxy.Stats, error) {
 		s.ByProtocol[proto] = count
 	}
 
-	// By anonymity
-	rows2, err := d.db.Query("SELECT COALESCE(anonymity, 'unknown'), COUNT(*) FROM proxies WHERE alive = TRUE GROUP BY anonymity")
+	// By anonymity (active only)
+	rows2, err := d.db.Query("SELECT COALESCE(anonymity, 'unknown'), COUNT(*) FROM proxies WHERE status = ? GROUP BY anonymity", proxy.ProxyStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("querying by anonymity: %w", err)
 	}
@@ -625,8 +643,8 @@ func (d *DB) Stats() (*proxy.Stats, error) {
 		s.ByAnonymity[anon] = count
 	}
 
-	// By country (top 20)
-	rows3, err := d.db.Query("SELECT COALESCE(country, 'unknown'), COUNT(*) FROM proxies WHERE alive = TRUE GROUP BY country ORDER BY COUNT(*) DESC LIMIT 20")
+	// By country (active only, top 20)
+	rows3, err := d.db.Query("SELECT COALESCE(country, 'unknown'), COUNT(*) FROM proxies WHERE status = ? GROUP BY country ORDER BY COUNT(*) DESC LIMIT 20", proxy.ProxyStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("querying by country: %w", err)
 	}
@@ -694,13 +712,28 @@ func (d *DB) LastScanRun() (*proxy.ScanRun, error) {
 }
 
 // buildWhere constructs a WHERE clause from a ProxyFilter.
+//
+// Status takes precedence over AliveOnly. If Status is set to "active" or
+// "stale", we filter by status. If Status is "all", no status filter is
+// applied. If Status is empty, we fall back to AliveOnly for backward
+// compatibility (alive=true was the previous default).
 func buildWhere(f proxy.ProxyFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
 
-	if f.AliveOnly {
-		conditions = append(conditions, "alive = TRUE")
+	switch f.Status {
+	case proxy.ProxyStatusActive, proxy.ProxyStatusStale:
+		conditions = append(conditions, "status = ?")
+		args = append(args, f.Status)
+	case "all":
+		// no status filter
+	case "":
+		if f.AliveOnly {
+			conditions = append(conditions, "status = ?")
+			args = append(args, proxy.ProxyStatusActive)
+		}
 	}
+
 	if f.Protocol != "" {
 		conditions = append(conditions, "protocol = ?")
 		args = append(args, string(f.Protocol))

@@ -96,15 +96,22 @@ type ScanRun struct {
 }
 
 // ProxyFilter contains query parameters for filtering proxies.
+//
+// Status filtering: when Status is empty (default), the filter behaves as if
+// AliveOnly were true — only active proxies are returned. Set Status to
+// ProxyStatusActive, ProxyStatusStale, or "all" to control this explicitly.
+// AliveOnly is kept for backward compatibility with code that predates the
+// status column; new code should set Status directly.
 type ProxyFilter struct {
-	Protocol   Protocol  `json:"protocol,omitempty"`
-	Anonymity  Anonymity `json:"anonymity,omitempty"`
-	Country    string    `json:"country,omitempty"`
-	MaxLatency int       `json:"max_latency,omitempty"`
-	Blocklisted *bool    `json:"blocklisted,omitempty"`
-	AliveOnly  bool      `json:"alive_only"`
-	Limit      int       `json:"limit,omitempty"`
-	Offset     int       `json:"offset,omitempty"`
+	Protocol    Protocol  `json:"protocol,omitempty"`
+	Anonymity   Anonymity `json:"anonymity,omitempty"`
+	Country     string    `json:"country,omitempty"`
+	MaxLatency  int       `json:"max_latency,omitempty"`
+	Blocklisted *bool     `json:"blocklisted,omitempty"`
+	AliveOnly   bool      `json:"alive_only"`
+	Status      string    `json:"status,omitempty"` // active|stale|all
+	Limit       int       `json:"limit,omitempty"`
+	Offset      int       `json:"offset,omitempty"`
 }
 
 // CandidateEntry represents a candidate in the validation queue.
@@ -126,11 +133,18 @@ const (
 
 // Stats contains aggregate statistics about the proxy database.
 type Stats struct {
-	TotalProxies int            `json:"total_proxies"`
-	AliveProxies int            `json:"alive_proxies"`
-	ByProtocol   map[string]int `json:"by_protocol"`
-	ByAnonymity  map[string]int `json:"by_anonymity"`
-	ByCountry    map[string]int `json:"by_country"`
-	LastScanRun  *ScanRun       `json:"last_scan_run,omitempty"`
-	AvgLatencyMs int            `json:"avg_latency_ms"`
+	TotalProxies   int            `json:"total_proxies"`
+	ActiveProxies  int            `json:"active_proxies"`
+	StaleProxies   int            `json:"stale_proxies"`
+	AliveProxies   int            `json:"alive_proxies"` // legacy alias for active_proxies
+	ByProtocol     map[string]int `json:"by_protocol"`
+	ByAnonymity    map[string]int `json:"by_anonymity"`
+	ByCountry      map[string]int `json:"by_country"`
+	LastScanRun    *ScanRun       `json:"last_scan_run,omitempty"`
+	AvgLatencyMs   int            `json:"avg_latency_ms"`
+	// RecheckBacklog is the count of proxies whose last_checked_at is older
+	// than 1 hour, regardless of status. Useful for monitoring whether the
+	// revalidator is keeping up. Approximate: it doesn't know the configured
+	// RECHECK_INTERVAL, so it uses a fixed 1h definition.
+	RecheckBacklog int `json:"recheck_backlog"`
 }

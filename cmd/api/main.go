@@ -124,7 +124,7 @@ func (a *apiServer) handleListProxies(w http.ResponseWriter, r *http.Request) {
 // handleRandomProxy returns a single random proxy matching the filter.
 func (a *apiServer) handleRandomProxy(w http.ResponseWriter, r *http.Request) {
 	filter := parseFilter(r)
-	filter.AliveOnly = true // random should always return alive proxies
+	filter.Status = proxy.ProxyStatusActive // random must always return active proxies
 	p, err := a.db.RandomProxy(filter)
 	if err != nil {
 		a.logger.Error("getting random proxy", "error", err)
@@ -167,10 +167,24 @@ func (a *apiServer) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseFilter extracts ProxyFilter from query parameters.
+//
+// Default is to return only active proxies. Override with:
+//   - ?status=active  — only active (default)
+//   - ?status=stale   — only stale (failing recently but kept around)
+//   - ?status=all     — both
+//   - ?alive=false    — legacy alias for ?status=all
 func parseFilter(r *http.Request) proxy.ProxyFilter {
 	q := r.URL.Query()
 	f := proxy.ProxyFilter{
-		AliveOnly: true, // default to alive only
+		Status: proxy.ProxyStatusActive, // default to active only
+	}
+
+	if v := q.Get("status"); v != "" {
+		s := strings.ToLower(v)
+		switch s {
+		case proxy.ProxyStatusActive, proxy.ProxyStatusStale, "all":
+			f.Status = s
+		}
 	}
 
 	if v := q.Get("protocol"); v != "" {
@@ -200,8 +214,10 @@ func parseFilter(r *http.Request) proxy.ProxyFilter {
 			f.Offset = n
 		}
 	}
+	// Legacy: ?alive=false maps to status=all so callers that previously
+	// asked for "everything including dead" still work.
 	if v := q.Get("alive"); v == "false" || v == "0" {
-		f.AliveOnly = false
+		f.Status = "all"
 	}
 	if v := q.Get("blocklisted"); v != "" {
 		b, err := strconv.ParseBool(v)
