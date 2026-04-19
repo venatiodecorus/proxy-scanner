@@ -21,26 +21,46 @@ const (
 	AnonymityElite       Anonymity = "elite"
 )
 
+// ProxyStatus values describe the lifecycle state of a proxy in the database.
+const (
+	// ProxyStatusActive indicates the proxy was validated recently. API
+	// consumers receive only active proxies by default.
+	ProxyStatusActive = "active"
+	// ProxyStatusStale indicates the proxy has failed enough consecutive
+	// rechecks to be hidden from the API, but is still kept around in case
+	// it comes back. Stale proxies are eventually evicted.
+	ProxyStatusStale = "stale"
+)
+
 // Proxy represents a validated proxy server.
 type Proxy struct {
-	ID              int64     `json:"id"`
-	IP              string    `json:"ip"`
-	Port            int       `json:"port"`
-	Protocol        Protocol  `json:"protocol"`
-	Anonymity       Anonymity `json:"anonymity,omitempty"`
-	Country         string    `json:"country,omitempty"`
-	City            string    `json:"city,omitempty"`
-	ASN             int       `json:"asn,omitempty"`
-	ASNOrg          string    `json:"asn_org,omitempty"`
-	ExitIP          string    `json:"exit_ip,omitempty"`
-	LatencyMs       int       `json:"latency_ms,omitempty"`
-	SupportsConnect bool      `json:"supports_connect"`
-	TLSInsecure     bool      `json:"tls_insecure"`
-	Blocklisted     bool      `json:"blocklisted"`
-	Blocklists      string    `json:"blocklists,omitempty"`
-	LastSeen        time.Time `json:"last_seen"`
-	FirstSeen       time.Time `json:"first_seen"`
-	Alive           bool      `json:"alive"`
+	ID                  int64      `json:"id"`
+	IP                  string     `json:"ip"`
+	Port                int        `json:"port"`
+	Protocol            Protocol   `json:"protocol"`
+	Anonymity           Anonymity  `json:"anonymity,omitempty"`
+	Country             string     `json:"country,omitempty"`
+	City                string     `json:"city,omitempty"`
+	ASN                 int        `json:"asn,omitempty"`
+	ASNOrg              string     `json:"asn_org,omitempty"`
+	ExitIP              string     `json:"exit_ip,omitempty"`
+	LatencyMs           int        `json:"latency_ms,omitempty"`
+	SupportsConnect     bool       `json:"supports_connect"`
+	TLSInsecure         bool       `json:"tls_insecure"`
+	Blocklisted         bool       `json:"blocklisted"`
+	Blocklists          string     `json:"blocklists,omitempty"`
+	LastSeen            time.Time  `json:"last_seen"`
+	FirstSeen           time.Time  `json:"first_seen"`
+	LastCheckedAt       *time.Time `json:"last_checked_at,omitempty"`
+	LastOkAt            *time.Time `json:"last_ok_at,omitempty"`
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	CheckCount          int        `json:"check_count"`
+	SuccessCount        int        `json:"success_count"`
+	Status              string     `json:"status"`
+	// Alive is a legacy field derived from Status == ProxyStatusActive.
+	// Kept for backward compatibility with existing API consumers; new code
+	// should read Status instead.
+	Alive bool `json:"alive"`
 }
 
 // Candidate represents a raw scan result from masscan — an IP:port pair
