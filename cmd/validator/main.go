@@ -253,17 +253,25 @@ func run(logger *slog.Logger) error {
 			select {
 			case workerCh <- entry:
 			case <-ctx.Done():
-				for range workerCh {
-				}
+				// Stop feeding workers; the close(workerCh) below will let
+				// any active workers drain and exit. Don't try to drain
+				// workerCh from this side — that's the workers' job.
+				goto drained
 			}
 		}
 	}
+drained:
 
 	close(workerCh)
 
+	// Cancel context so any in-flight network operations in workers see
+	// the cancellation on their next syscall. Without this, well-behaved
+	// workers would still wait out their per-check timeout.
+	cancel()
+
 	// Wait for workers with a hard timeout so the process always exits.
-	// Some proxy validations can hang on unresponsive targets; this ensures
-	// we don't block indefinitely after the queue is empty.
+	// Some proxy validations can hang on unresponsive targets despite
+	// per-check timeouts; the hard timeout below is the last line of defense.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -271,9 +279,10 @@ func run(logger *slog.Logger) error {
 	}()
 
 	shutdownTimeout := time.Duration(timeout)*time.Second + 30*time.Second
+	workersFinished := false
 	select {
 	case <-done:
-		// Workers finished cleanly
+		workersFinished = true
 	case <-time.After(shutdownTimeout):
 		logger.Warn("workers did not finish within timeout, forcing exit",
 			"timeout", shutdownTimeout,
@@ -284,12 +293,24 @@ func run(logger *slog.Logger) error {
 
 	totalVerified := int(verified.Load())
 	status := "completed"
-	if ctx.Err() != nil {
+	if ctx.Err() != nil && !workersFinished {
 		status = "interrupted"
 	}
 
-	if err := db.FinishScanRun(startID, totalProcessed, totalVerified, status); err != nil {
-		return fmt.Errorf("finishing scan run: %w", err)
+	// Run cleanup with a bounded timeout. SQLite writes can block if the
+	// scanner currently holds the single writer lock; we don't want that
+	// to delay process exit.
+	cleanupDone := make(chan struct{})
+	go func() {
+		if err := db.FinishScanRun(startID, totalProcessed, totalVerified, status); err != nil {
+			logger.Error("failed to finish scan run", "error", err)
+		}
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+	case <-time.After(15 * time.Second):
+		logger.Warn("cleanup (FinishScanRun) timed out, forcing exit")
 	}
 
 	logger.Info("validation complete",
@@ -297,8 +318,14 @@ func run(logger *slog.Logger) error {
 		"candidates", totalProcessed,
 		"verified", totalVerified,
 		"run_id", startID,
+		"workers_finished_cleanly", workersFinished,
 	)
 
+	// If workers were stuck, they may still be holding goroutines. Force exit
+	// rather than relying on main() to return (defers may also hang).
+	if !workersFinished {
+		os.Exit(1)
+	}
 	return nil
 }
 
