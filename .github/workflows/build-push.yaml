@@ -197,6 +197,9 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/proxy-scanner
-            docker compose pull
+            # --profile scan is required to pull profile-gated services
+            # (scanner, validator). Without it, Compose silently skips them
+            # and they go stale on the VPS.
+            docker compose --profile scan pull
             docker compose up -d api revalidator
             docker image prune -f
