@@ -29,7 +29,7 @@ services:
       - scanner-data:/data
     environment:
       SCAN_RATE: "100000"
-      SCAN_PORTS: "3128,8080,1080,8888,9050,8443,3129,80,443,1081"
+      SCAN_PORTS: "1080,1081,9050"
       SCAN_ADAPTER: "ens3"
       DB_PATH: /data/proxies.db
       OUTPUT_FILE: /data/candidates.json
@@ -49,8 +49,9 @@ services:
       WORKERS: "500"
       TIMEOUT: "10"
       TEST_URL: "http://httpbin.org/ip"
-      # SKIP_BLOCKLIST: "true"  # uncomment to disable DNSBL checking
-      # BATCH_SIZE: "1000"      # candidates to dequeue per batch
+      # EFnet RBL checks of endpoint and observed exit IP are mandatory.
+      # SKIP_AUX_BLOCKLISTS: "true"  # disable only optional auxiliary DNSBLs
+      # BATCH_SIZE: "1000"            # candidates to dequeue per batch
 
   # Long-running service that periodically rechecks validated proxies and
   # evicts ones that have been failing for too long. Runs alongside the API
@@ -74,7 +75,8 @@ services:
       FAILURE_THRESHOLD: "3"      # consecutive fails before marking 'stale'
       EVICT_AFTER: "168h"         # delete stale proxies after 7 days w/o success
       EVICT_INTERVAL: "1h"        # how often to run the eviction sweep
-      # SKIP_BLOCKLIST: "true"    # uncomment to skip DNSBL on rechecks
+      # EFnet RBL checks of endpoint and observed exit IP are mandatory.
+      # SKIP_AUX_BLOCKLISTS: "true"  # disable only optional auxiliary DNSBLs
 
 volumes:
   scanner-data:

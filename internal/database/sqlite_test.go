@@ -666,6 +666,36 @@ func TestRecordCheckFailureBelowThreshold(t *testing.T) {
 	}
 }
 
+func TestRecordEligibilityFailureImmediatelyStalesProxy(t *testing.T) {
+	db := mustOpen(t)
+
+	p := &proxy.Proxy{IP: "1.1.1.1", Port: 1080, Protocol: proxy.ProtocolSOCKS5, Alive: true}
+	if err := db.UpsertProxy(p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	id := got[0].ID
+	lastOK := got[0].LastOkAt
+
+	if err := db.RecordEligibilityFailure(id, true, "rbl.efnetrbl.org"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{Status: "all"})
+	row := got[0]
+	if row.Status != proxy.ProxyStatusStale || row.Alive {
+		t.Fatalf("expected stale/inactive proxy, got status=%q alive=%v", row.Status, row.Alive)
+	}
+	if !row.Blocklisted || row.Blocklists != "rbl.efnetrbl.org" {
+		t.Fatalf("expected EFnet blocklist metadata, got blocklisted=%v blocklists=%q", row.Blocklisted, row.Blocklists)
+	}
+	if row.CheckCount != 2 || row.ConsecutiveFailures != 1 {
+		t.Fatalf("unexpected counters: check_count=%d consecutive_failures=%d", row.CheckCount, row.ConsecutiveFailures)
+	}
+	if lastOK == nil || row.LastOkAt == nil || !row.LastOkAt.Equal(*lastOK) {
+		t.Fatal("eligibility failure must preserve last_ok_at")
+	}
+}
+
 func TestRecordCheckSuccessPreservesBlocklistByDefault(t *testing.T) {
 	db := mustOpen(t)
 
@@ -714,14 +744,21 @@ func TestRecordCheckSuccessPreservesBlocklistByDefault(t *testing.T) {
 func TestListProxiesForRecheck(t *testing.T) {
 	db := mustOpen(t)
 
-	// Three proxies.
+	// Three SOCKS proxies plus one legacy HTTP row that must not be rechecked.
 	for _, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"} {
-		if err := db.UpsertProxy(&proxy.Proxy{IP: ip, Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+		if err := db.UpsertProxy(&proxy.Proxy{IP: ip, Port: 1080, Protocol: proxy.ProtocolSOCKS5, Alive: true}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "4.4.4.4", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE proxies SET last_checked_at = ? WHERE ip = '4.4.4.4'", time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 
-	// All were just upserted, so last_checked_at is ~now. With minAge=1h
+	// SOCKS rows were just upserted, so last_checked_at is ~now. The old HTTP
+	// row is excluded from the SOCKS-only recheck set.
 	// none should be eligible.
 	due, err := db.ListProxiesForRecheck(10, time.Hour)
 	if err != nil {
@@ -766,10 +803,10 @@ func TestListProxiesForRecheck(t *testing.T) {
 func TestListProxiesForRecheckNullCheckedFirst(t *testing.T) {
 	db := mustOpen(t)
 
-	if err := db.UpsertProxy(&proxy.Proxy{IP: "1.1.1.1", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "1.1.1.1", Port: 1080, Protocol: proxy.ProtocolSOCKS5, Alive: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpsertProxy(&proxy.Proxy{IP: "2.2.2.2", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "2.2.2.2", Port: 1080, Protocol: proxy.ProtocolSOCKS4, Alive: true}); err != nil {
 		t.Fatal(err)
 	}
 	// Wipe last_checked_at on one row to simulate a row from before liveness tracking.

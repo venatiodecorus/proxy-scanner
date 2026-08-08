@@ -22,7 +22,7 @@ func (m *mockResolver) LookupHost(ctx context.Context, host string) ([]string, e
 	if addrs, ok := m.results[host]; ok {
 		return addrs, nil
 	}
-	return nil, &net.DNSError{Err: "not found", Name: host}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 }
 
 func TestReverseIP(t *testing.T) {
@@ -75,6 +75,63 @@ func TestChecker_Check_Listed(t *testing.T) {
 	}
 	if len(result.Blocklists) != 1 || result.Blocklists[0] != "test.bl.example.com" {
 		t.Errorf("expected blocklist [test.bl.example.com], got %v", result.Blocklists)
+	}
+}
+
+func TestChecker_CheckList_EFnetListed(t *testing.T) {
+	mock := &mockResolver{
+		results: map[string][]string{
+			"4.3.2.1.rbl.efnetrbl.org": {"127.0.0.1"},
+		},
+	}
+	c := NewChecker(WithResolver(mock))
+
+	result := c.CheckList(context.Background(), "1.2.3.4", EFnetList)
+	if result.Err != nil {
+		t.Fatalf("unexpected error: %v", result.Err)
+	}
+	if !result.Listed {
+		t.Fatal("expected EFnet-listed result")
+	}
+	if len(result.Addresses) != 1 || result.Addresses[0] != "127.0.0.1" {
+		t.Fatalf("unexpected response addresses: %v", result.Addresses)
+	}
+}
+
+func TestChecker_CheckList_NotFoundIsClean(t *testing.T) {
+	c := NewChecker(WithResolver(&mockResolver{}))
+
+	result := c.CheckList(context.Background(), "1.2.3.4", EFnetList)
+	if result.Err != nil {
+		t.Fatalf("expected clean result, got error: %v", result.Err)
+	}
+	if result.Listed {
+		t.Fatal("expected IP not to be listed")
+	}
+}
+
+func TestChecker_CheckList_ResolverFailureIsIndeterminate(t *testing.T) {
+	host := "4.3.2.1.rbl.efnetrbl.org"
+	mock := &mockResolver{err: map[string]error{
+		host: &net.DNSError{Err: "server misbehaving", Name: host, IsTemporary: true},
+	}}
+	c := NewChecker(WithResolver(mock))
+
+	result := c.CheckList(context.Background(), "1.2.3.4", EFnetList)
+	if result.Err == nil {
+		t.Fatal("expected resolver failure to be indeterminate")
+	}
+	if result.Listed {
+		t.Fatal("indeterminate result must not be reported as listed")
+	}
+}
+
+func TestChecker_CheckList_InvalidIPIsIndeterminate(t *testing.T) {
+	c := NewChecker(WithResolver(&mockResolver{}))
+
+	result := c.CheckList(context.Background(), "not-an-ip", EFnetList)
+	if result.Err == nil {
+		t.Fatal("expected invalid IP error")
 	}
 }
 

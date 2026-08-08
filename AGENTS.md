@@ -2,20 +2,20 @@
 
 ## Project Overview
 
-This is a Go monorepo that produces three container images for an open proxy scanning system, deployed via Docker Compose.
+This is a Go monorepo that produces four container images for a SOCKS-only open proxy scanning system, deployed via Docker Compose: scanner, validator, revalidator, and API.
 
 ## Architecture
 
 Four components, four container images:
 
-1. **Scanner** (`cmd/scanner/`, `docker/Dockerfile.scanner`) — Go binary wrapping masscan. Runs on-demand via Docker Compose scan profile. Scans IPv4 space for open proxy ports, then enqueues candidates into the SQLite database. The Scanner writes masscan JSON output to disk (for debugging) but the primary data path is the `candidates` queue table in SQLite.
-2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs on-demand via Docker Compose scan profile. Reads candidates from the `candidates` queue table, validates each as a working proxy (HTTP/HTTPS/SOCKS4/SOCKS5), measures latency, checks anonymity, checks DNSBL blocklists, detects CONNECT support and TLS cert issues, tags with GeoIP. Validated proxies are upserted into the `proxies` table; processed candidates are deleted from the queue. On startup, resets any `processing` candidates back to `pending` for crash recovery.
-3. **Revalidator** (`cmd/revalidator/`, `docker/Dockerfile.revalidator`) — Go binary. Long-running, runs by default alongside the API. Periodically rechecks proxies in the `proxies` table to keep the live set fresh. Marks proxies `stale` after consecutive failures and evicts them after a grace period. Uses the same checker code as the Validator.
+1. **Scanner** (`cmd/scanner/`, `docker/Dockerfile.scanner`) — Go binary wrapping masscan. Runs on-demand via Docker Compose scan profile. Scans IPv4 space on the SOCKS ports `1080,1081,9050`, then enqueues candidates into the SQLite database. The Scanner writes masscan JSON output to disk (for debugging) but the primary data path is the `candidates` queue table in SQLite.
+2. **Validator** (`cmd/validator/`, `docker/Dockerfile.validator`) — Go binary. Runs on-demand via Docker Compose scan profile. Reads candidates from the `candidates` queue table, validates each as a working SOCKS4 or SOCKS5 proxy, measures latency, checks anonymity, applies mandatory `rbl.efnetrbl.org` eligibility checks to the endpoint and observed exit IP, optionally checks auxiliary DNSBLs, and tags with GeoIP. EFnet-listed candidates are rejected; indeterminate EFnet lookups are deferred and never accepted. Validated proxies are upserted into the `proxies` table; processed candidates are deleted from the queue. On startup, resets any `processing` candidates back to `pending` for crash recovery.
+3. **Revalidator** (`cmd/revalidator/`, `docker/Dockerfile.revalidator`) — Go binary. Long-running, runs by default alongside the API. Periodically rechecks SOCKS proxies and mandatory EFnet eligibility to keep the live set fresh. Listed proxies are marked `stale`; indeterminate EFnet lookups fail closed. Other failures mark proxies `stale` after consecutive failures, and stale proxies are evicted after a grace period. Uses the same checker and blocklist code as the Validator.
 4. **API** (`cmd/api/`, `docker/Dockerfile.api`) — Go REST API. Runs continuously. Serves proxy data from SQLite at `http://localhost:8080/v1/`.
 
 All four components share a SQLite database via a Docker named volume. The `candidates` table acts as a durable work queue — the Scanner enqueues, the Validator dequeues and processes. Candidates are removed from the queue after processing (whether validated or failed), so the Validator never reprocesses the same candidate.
 
-The `proxies` table tracks per-row liveness via `status` (`active` or `stale`), `last_checked_at`, `last_ok_at`, `consecutive_failures`, `check_count`, and `success_count`. The Revalidator drives the lifecycle: successful rechecks reset failures and refresh latency; failures increment the counter; reaching the failure threshold flips a row to `stale` (hidden from API by default); rows that stay stale past the grace period get hard-deleted.
+The `proxies` table tracks per-row liveness via `status` (`active` or `stale`), `last_checked_at`, `last_ok_at`, `consecutive_failures`, `check_count`, and `success_count`. The Revalidator drives the lifecycle: successful SOCKS and mandatory EFnet rechecks reset failures and refresh latency; failures increment the counter; EFnet-listed proxies are staled; reaching the failure threshold flips other failing rows to `stale` (hidden from API by default); rows that stay stale past the grace period get hard-deleted.
 
 ## Code Structure
 
@@ -38,16 +38,18 @@ docker-compose.yml       — Docker Compose configuration
 ## Key Technical Details
 
 - **Go module**: `github.com/venatiodecorus/proxy-scanner`
-- **Database**: SQLite with WAL mode. Single writer (validator), single reader (API). DB file at `/data/proxies.db`.
+- **Database**: SQLite with WAL mode. The validator and revalidator write while the API reads. DB file at `/data/proxies.db`.
 - **Candidates queue**: The `candidates` table in SQLite serves as a durable work queue. Scanner enqueues (INSERT OR IGNORE), Validator dequeues (SELECT pending → UPDATE to processing) and deletes after processing. On validator startup, any `processing` candidates are reset to `pending` for crash recovery.
+- **Protocols and ports**: New scans and validation are SOCKS4/SOCKS5 only. The default target ports are `1080,1081,9050`.
 - **Scan output**: Masscan JSON at `/data/candidates.json` on the shared volume (debugging artifact). The primary data path is the SQLite queue.
 - **Scan resume**: The scanner supports masscan's `--resume` feature for incremental scanning. When `SCAN_TIMEOUT` is set, the scanner sends SIGINT to masscan after the timeout, causing masscan to save its state to `/data/paused.conf`. On the next run, the scanner detects this file and resumes from where it left off. This allows weekly scan sessions that make incremental progress through the entire IPv4 space without re-scanning previously covered ranges.
 - **Masscan build**: Scanner image builds masscan from a pinned upstream master commit (see `docker/Dockerfile.scanner`) rather than using Alpine's `masscan` package. The last tagged masscan release (1.3.2, Feb 2021) predates the fix for upstream issue [#559](https://github.com/robertdavidgraham/masscan/issues/559) — paused.conf contains a `nocapture = servername` line that 1.3.2's config parser cannot read back, making `--resume` fail immediately. Master fixed this in commit `9065684c` (2023-06-07). Bump `MASSCAN_SHA` in the Dockerfile deliberately, not automatically.
-- **Container registry**: `ghcr.io/venatiodecorus/proxy-scanner-{scanner,validator,api}`
-- **GeoIP**: MaxMind GeoLite2-City + ASN databases bundled in the validator image at `/geoip/`. Source `.mmdb` files are committed in `data/`.
-- **Egress IP**: Validator auto-detects public IP at startup via external services (ipify, ifconfig.me, etc.). Override with `ORIGIN_IP` env var.
-- **CI/CD**: GitHub Actions builds and pushes all 3 images to GHCR on push to main. PRs run tests + vet.
-- **Docker Compose**: Scanner and validator are in the `scan` profile (`docker compose --profile scan up`). API runs by default (`docker compose up -d api`). Data persists via a named volume `scanner-data`.
+- **EFnet eligibility hard gate**: Validator and revalidator query `rbl.efnetrbl.org` for both the proxy endpoint and observed exit IP. Listed candidates are rejected, listed existing proxies are marked `stale`, and indeterminate lookups are deferred or fail closed. This check cannot be disabled. `SKIP_AUX_BLOCKLISTS` controls only optional auxiliary DNSBLs.
+- **Container registry**: `ghcr.io/venatiodecorus/proxy-scanner-{scanner,validator,revalidator,api}`
+- **GeoIP**: MaxMind GeoLite2-City + ASN databases are bundled in the validator and revalidator images at `/geoip/`. Source `.mmdb` files are committed in `data/`.
+- **Egress IP**: Validator and revalidator auto-detect the public IP at startup via external services (ipify, ifconfig.me, etc.). Override with `ORIGIN_IP` env var.
+- **CI/CD**: GitHub Actions builds and pushes all 4 images to GHCR on push to main. PRs run tests + vet.
+- **Docker Compose**: Scanner and validator are in the `scan` profile (`docker compose --profile scan up`). API and revalidator run by default (`docker compose up -d api revalidator`). Data persists via a named volume `scanner-data`.
 
 ## Development Guidelines
 
@@ -61,7 +63,7 @@ docker-compose.yml       — Docker Compose configuration
 
 ### Scanner (`cmd/scanner`)
 - `SCAN_RATE` — Masscan packets per second (default: `50000`)
-- `SCAN_PORTS` — Comma-separated port list (default: `3128,8080,1080,8888,9050,8443,3129,80,443,1081`)
+- `SCAN_PORTS` — Comma-separated SOCKS port list (default: `1080,1081,9050`)
 - `SCAN_ADAPTER` — Network interface for masscan (default: `ens3`)
 - `EXCLUDE_FILE` — Path to CIDR exclusion file (default: `/config/exclude.conf`)
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
@@ -76,8 +78,8 @@ docker-compose.yml       — Docker Compose configuration
 - `ORIGIN_IP` — Public IP of the scanner node for anonymity detection (default: auto-detected)
 - `WORKERS` — Number of concurrent validation goroutines (default: `500`)
 - `TIMEOUT` — Per-proxy validation timeout in seconds (default: `10`)
-- `TEST_URL` — URL to request through the proxy for validation (default: `http://httpbin.org/ip`)
-- `SKIP_BLOCKLIST` — Set to `true` to disable DNSBL blocklist checking (default: `false`)
+- `TEST_URL` — Origin URL to request through the SOCKS proxy for validation; the response must expose the observed IPv4 exit address (default: `http://httpbin.org/ip`)
+- `SKIP_AUX_BLOCKLISTS` — Set to `true` to disable optional auxiliary DNSBLs (default: `false`). Mandatory endpoint and observed-exit checks against `rbl.efnetrbl.org` always run.
 - `BATCH_SIZE` — Number of candidates to dequeue per batch (default: `1000`)
 
 ### Revalidator (`cmd/revalidator`)
@@ -85,9 +87,9 @@ docker-compose.yml       — Docker Compose configuration
 - `GEOIP_CITY_DB` / `GEOIP_ASN_DB` — Path to MaxMind databases (defaults: `/geoip/...`)
 - `WORKERS` — Concurrent recheck goroutines (default: `100`, lower than validator since this is background work)
 - `TIMEOUT` — Per-check timeout in seconds (default: `10`)
-- `TEST_URL` — URL to request through the proxy (default: `http://httpbin.org/ip`)
+- `TEST_URL` — Origin URL to request through the SOCKS proxy; the response must expose the observed IPv4 exit address (default: `http://httpbin.org/ip`)
 - `ORIGIN_IP` — Public IP for anonymity detection (default: auto-detected)
-- `SKIP_BLOCKLIST` — Disable DNSBL on rechecks (default: `false`)
+- `SKIP_AUX_BLOCKLISTS` — Disable optional auxiliary DNSBLs on rechecks (default: `false`). Mandatory endpoint and observed-exit checks against `rbl.efnetrbl.org` always run.
 - `BATCH_SIZE` — Proxies pulled per recheck batch (default: `500`)
 - `RECHECK_INTERVAL` — Don't recheck a proxy more often than this (default: `1h`)
 - `IDLE_SLEEP` — Sleep duration when nothing is due for recheck (default: `60s`)
@@ -108,15 +110,16 @@ The API filters by proxy status. Default is `?status=active` (only proxies that 
 - Error handling: wrap errors with context using `fmt.Errorf("doing X: %w", err)`.
 - No global state. Pass dependencies explicitly.
 - Database operations go through the `database.DB` struct, not raw SQL in business logic.
-- Proxy checking logic is in `internal/proxy/checker.go`. Each protocol has its own check function.
-- Blocklist checking is in `internal/blocklist/dnsbl.go`. Uses DNSBL (DNS-based blocklists) to flag known-abuse IPs.
-- The validator orchestrates: parse input -> fan out to workers -> check proxy -> check blocklists -> write to DB.
+- Proxy checking logic is in `internal/proxy/checker.go`, with SOCKS4 and SOCKS5 check functions only for new validation.
+- Blocklist checking is in `internal/blocklist/dnsbl.go`. Treat `rbl.efnetrbl.org` as a mandatory eligibility gate for both endpoint and observed exit IP; optional auxiliary DNSBLs may be skipped with `SKIP_AUX_BLOCKLISTS`.
+- Never convert an indeterminate EFnet lookup into an eligible result. Initial validation must defer it, and revalidation must fail closed.
+- The validator orchestrates: parse input -> fan out to workers -> check SOCKS proxy -> enforce EFnet eligibility -> optionally check auxiliary blocklists -> write to DB.
 
 ## Testing
 
 - `go test ./...` runs all tests.
 - Database tests use in-memory SQLite (`:memory:`).
-- Proxy checker tests use mock HTTP servers where possible.
+- Proxy checker tests use local mock origin and SOCKS servers where possible.
 - No integration tests that require real network scanning.
 
 ## Exclusion List Management
@@ -139,7 +142,8 @@ Files are numbered so they merge in predictable order via `cat config/exclude/*.
 - Run a scan: `docker compose --profile scan up scanner`
 - Run the validator: `docker compose --profile scan up validator`
 - The scanner and validator can be run independently. The scanner enqueues candidates to SQLite; the validator dequeues and processes them.
-- The revalidator runs by default (no profile required) alongside the API. It rechecks existing proxies on `RECHECK_INTERVAL` (default 1h), demotes failing ones to `stale` after `FAILURE_THRESHOLD` consecutive failures, and hard-deletes them after `EVICT_AFTER` without a successful check.
+- The revalidator runs by default (no profile required) alongside the API. It rechecks existing SOCKS proxies and mandatory EFnet eligibility on `RECHECK_INTERVAL` (default 1h), immediately stales EFnet-listed proxies, demotes other failing ones to `stale` after `FAILURE_THRESHOLD` consecutive failures, and hard-deletes them after `EVICT_AFTER` without a successful check.
+- When cutting over from the historical mixed-port scanner, back up the database, remove `/data/paused.conf`, clear the old candidates queue, and remove HTTP/HTTPS proxy rows explicitly; this cleanup is intentionally not automatic.
 - For incremental weekly scanning: Set `SCAN_TIMEOUT` (e.g. `4h`) so masscan saves state on timeout. Next run resumes automatically via `/data/paused.conf`.
 - All four components share a named Docker volume `scanner-data` mounted at `/data`.
 - SQLite WAL mode allows concurrent reads (API) and writes from validator + revalidator. The single-writer constraint is handled by `_busy_timeout=5000` and per-process connections; transient `SQLITE_BUSY` retries are expected during heavy validator runs.

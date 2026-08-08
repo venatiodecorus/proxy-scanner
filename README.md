@@ -1,6 +1,6 @@
 # Proxy Scanner
 
-A system that scans the public IPv4 space for open proxies (HTTP, HTTPS, SOCKS4, SOCKS5), validates them, measures latency, classifies anonymity level, enriches with GeoIP/ASN data, and exposes verified proxies via a REST API.
+A system that scans the public IPv4 space for open SOCKS4 and SOCKS5 proxies, validates them, enforces mandatory EFnet RBL eligibility checks, measures latency, classifies anonymity level, enriches with GeoIP/ASN data, and exposes verified proxies via a REST API.
 
 Deployed via Docker Compose.
 
@@ -17,8 +17,8 @@ Deployed via Docker Compose.
 │         │ candidates table (SQLite queue)                 │
 │         ▼                                                │
 │  ┌──────────────┐    on-demand (scan profile)            │
-│  │  validator   │──→ Go: dequeues candidates, validates  │
-│  │  (Go)        │    proxies, GeoIP/ASN tagging          │
+│  │  validator   │──→ Go: validates SOCKS4/SOCKS5,        │
+│  │  (Go)        │    enforces EFnet RBL, tags GeoIP/ASN  │
 │  └──────┬───────┘                                        │
 │         │ proxies table (SQLite)                         │
 │         ▼                                                │
@@ -40,11 +40,13 @@ Four components, four container images:
 | Component | Image | Purpose |
 |-----------|-------|---------|
 | Scanner | `ghcr.io/venatiodecorus/proxy-scanner-scanner` | Masscan sweep → SQLite queue |
-| Validator | `ghcr.io/venatiodecorus/proxy-scanner-validator` | Dequeue candidates, validate proxies, write to `proxies` table |
-| Revalidator | `ghcr.io/venatiodecorus/proxy-scanner-revalidator` | Periodically rechecks live proxies, demotes failing ones to `stale`, evicts dead ones |
+| Validator | `ghcr.io/venatiodecorus/proxy-scanner-validator` | Dequeue candidates, validate SOCKS4/SOCKS5 proxies, enforce EFnet RBL eligibility, write to `proxies` table |
+| Revalidator | `ghcr.io/venatiodecorus/proxy-scanner-revalidator` | Periodically rechecks live proxies and EFnet eligibility, demotes failing or listed ones to `stale`, evicts dead ones |
 | API | `ghcr.io/venatiodecorus/proxy-scanner-api` | REST API serving proxy data from SQLite |
 
-The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates; the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
+The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates from the default SOCKS port set (`1080,1081,9050`); the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
+
+EFnet RBL eligibility is a mandatory hard gate. The validator checks both the proxy endpoint IP and the observed exit IP against `rbl.efnetrbl.org`; a listed address rejects the candidate. The revalidator applies the same checks and marks listed proxies `stale`. Indeterminate EFnet lookups are never treated as eligible: initial validation is deferred, and revalidation fails closed. Optional auxiliary DNSBL checks can be disabled with `SKIP_AUX_BLOCKLISTS=true`, but EFnet checks cannot be disabled.
 
 The revalidator runs continuously alongside the API and rechecks the `proxies` table on a configurable interval (default 1h). Proxies that fail `FAILURE_THRESHOLD` consecutive checks (default 3) are marked `stale` (hidden from the API by default); proxies that stay stale for `EVICT_AFTER` (default 7 days) without a successful recheck are deleted.
 
@@ -60,6 +62,19 @@ docker compose --profile scan up scanner
 # Run the validator (dequeues from SQLite, validates, writes to proxies table)
 docker compose --profile scan up validator
 ```
+
+## SOCKS-only cutover
+
+Existing data is not deleted automatically. Before the first scan with this release, stop the scanner, validator, and revalidator and back up `/data/proxies.db`. A saved masscan resume file contains the old mixed-port scan configuration, so remove `/data/paused.conf` and rotate `/data/candidates.json` before starting a new SOCKS-only scan.
+
+For a clean cutover, clear candidates from the previous mixed-port campaign and remove previously validated HTTP/HTTPS rows:
+
+```sql
+DELETE FROM candidates;
+DELETE FROM proxies WHERE protocol NOT IN ('socks4', 'socks5');
+```
+
+The validator now requires `TEST_URL` to return the observed IPv4 exit address in its response body. The default `http://httpbin.org/ip` satisfies this requirement.
 
 ## Incremental Scanning
 
@@ -104,6 +119,8 @@ docker logs -f proxy-scanner-scanner
 docker logs -f proxy-scanner-validator
 ```
 
+The scanner and validator also emit structured progress totals every 15 minutes. Scanner entries include elapsed time, completed masscan JSON records, output size, and pending queue depth. Validator entries include processed/dequeued totals, verified proxies, EFnet rejections, deferred candidates, and pending queue depth.
+
 ## Monitoring Bandwidth
 
 If your VPS has limited bandwidth, install **vnstat** on the host to track usage across all containers:
@@ -138,7 +155,7 @@ Since the scanner uses `network_mode: host`, all container traffic flows through
 
 | Parameter | Example | Description |
 |-----------|---------|-------------|
-| `protocol` | `http`, `socks5` | Filter by protocol |
+| `protocol` | `socks4`, `socks5` | Filter by protocol. New validation results are SOCKS-only; the API schema remains compatible with historical stored protocol values. |
 | `anonymity` | `elite`, `anonymous`, `transparent` | Filter by anonymity level |
 | `country` | `US`, `DE` | Filter by ISO country code |
 | `max_latency` | `500` | Maximum latency in ms |
@@ -153,8 +170,8 @@ Since the scanner uses `network_mode: host`, all container traffic flows through
 # Get 5 fast elite SOCKS5 proxies in Germany
 curl "http://localhost:8080/v1/proxies?protocol=socks5&anonymity=elite&country=DE&max_latency=500&limit=5"
 
-# Get a random HTTP proxy
-curl "http://localhost:8080/v1/proxies/random?protocol=http"
+# Get a random SOCKS4 proxy
+curl "http://localhost:8080/v1/proxies/random?protocol=socks4"
 
 # Stats overview
 curl "http://localhost:8080/v1/stats"
@@ -181,6 +198,9 @@ CGO_ENABLED=1 go build -o bin/scanner ./cmd/scanner/
 
 # Validator
 CGO_ENABLED=1 go build -o bin/validator ./cmd/validator/
+
+# Revalidator
+CGO_ENABLED=1 go build -o bin/revalidator ./cmd/revalidator/
 
 # API
 CGO_ENABLED=1 go build -o bin/api ./cmd/api/
@@ -237,13 +257,13 @@ cmd/
   api/main.go                Entry point: REST API server
 internal/
   proxy/
-    checker.go               HTTP/HTTPS/SOCKS4/SOCKS5 proxy validation
+    checker.go               SOCKS4/SOCKS5 proxy validation
     geoip.go                 MaxMind GeoLite2 City + ASN lookups
     types.go                 Shared types (Proxy, Candidate, CandidateEntry, etc.)
   database/
     sqlite.go                SQLite operations (queue, upsert, query, stats)
   blocklist/
-    dnsbl.go                 DNSBL blocklist checking
+    dnsbl.go                 Mandatory EFnet RBL and optional auxiliary DNSBL checks
   scanner/
     parser.go                Masscan JSON output parser
 data/
@@ -271,7 +291,7 @@ docker-compose.yml           Docker Compose configuration
 ## CI/CD
 
 - **Pull requests**: GitHub Actions runs `go test` and `go vet`
-- **Push to main**: Builds all 3 Docker images and pushes to GHCR with `sha-<commit>` and `latest` tags
+- **Push to main**: Builds all 4 Docker images and pushes to GHCR with `sha-<commit>` and `latest` tags
 
 No additional secrets or configuration required. The workflow uses the built-in `GITHUB_TOKEN`.
 
@@ -292,7 +312,7 @@ To add a new exclusion (e.g., after an abuse complaint):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCAN_RATE` | `50000` | Masscan packets per second |
-| `SCAN_PORTS` | `3128,8080,1080,...` | Target ports (comma-separated) |
+| `SCAN_PORTS` | `1080,1081,9050` | SOCKS target ports (comma-separated) |
 | `SCAN_ADAPTER` | `ens3` | Network interface for masscan |
 | `EXCLUDE_FILE` | `/config/exclude.conf` | CIDR exclusion list |
 | `DB_PATH` | `/data/proxies.db` | SQLite database path |
@@ -310,9 +330,28 @@ To add a new exclusion (e.g., after an abuse complaint):
 | `ORIGIN_IP` | *(auto-detected)* | Public IP for anonymity detection |
 | `WORKERS` | `500` | Concurrent validation goroutines |
 | `TIMEOUT` | `10` | Per-proxy timeout in seconds |
-| `TEST_URL` | `http://httpbin.org/ip` | URL to request through proxies |
-| `SKIP_BLOCKLIST` | `false` | Disable DNSBL blocklist checking |
+| `TEST_URL` | `http://httpbin.org/ip` | Origin URL requested through SOCKS proxies; response must expose the observed IPv4 exit address |
+| `SKIP_AUX_BLOCKLISTS` | `false` | Disable optional auxiliary DNSBLs only; mandatory endpoint and observed-exit checks against `rbl.efnetrbl.org` remain enabled |
 | `BATCH_SIZE` | `1000` | Candidates to dequeue per batch |
+
+### Revalidator
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_PATH` | `/data/proxies.db` | Path to SQLite database |
+| `GEOIP_CITY_DB` | `/geoip/GeoLite2-City.mmdb` | MaxMind City database |
+| `GEOIP_ASN_DB` | `/geoip/GeoLite2-ASN.mmdb` | MaxMind ASN database |
+| `ORIGIN_IP` | *(auto-detected)* | Public IP for anonymity detection |
+| `WORKERS` | `100` | Concurrent recheck goroutines |
+| `TIMEOUT` | `10` | Per-proxy timeout in seconds |
+| `TEST_URL` | `http://httpbin.org/ip` | Origin URL requested through SOCKS proxies; response must expose the observed IPv4 exit address |
+| `SKIP_AUX_BLOCKLISTS` | `false` | Disable optional auxiliary DNSBLs only; mandatory endpoint and observed-exit checks against `rbl.efnetrbl.org` remain enabled |
+| `BATCH_SIZE` | `500` | Proxies pulled per recheck batch |
+| `RECHECK_INTERVAL` | `1h` | Minimum interval between proxy rechecks |
+| `IDLE_SLEEP` | `60s` | Sleep duration when nothing is due |
+| `FAILURE_THRESHOLD` | `3` | Consecutive failures before marking a proxy `stale` |
+| `EVICT_AFTER` | `168h` | Delete stale proxies after 7 days without success |
+| `EVICT_INTERVAL` | `1h` | Interval between eviction sweeps |
 
 ### API
 

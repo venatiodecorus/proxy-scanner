@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,38 +50,38 @@ func main() {
 }
 
 type config struct {
-	dbPath           string
-	geoipCityDB      string
-	geoipASNDB       string
-	workers          int
-	timeout          time.Duration
-	testURL          string
-	originIP         string
-	skipBlocklist    bool
-	batchSize        int
-	recheckInterval  time.Duration
-	idleSleep        time.Duration
-	failureThreshold int
-	evictAfter       time.Duration
-	evictInterval    time.Duration
+	dbPath            string
+	geoipCityDB       string
+	geoipASNDB        string
+	workers           int
+	timeout           time.Duration
+	testURL           string
+	originIP          string
+	skipAuxBlocklists bool
+	batchSize         int
+	recheckInterval   time.Duration
+	idleSleep         time.Duration
+	failureThreshold  int
+	evictAfter        time.Duration
+	evictInterval     time.Duration
 }
 
 func loadConfig() config {
 	return config{
-		dbPath:           envOrDefault("DB_PATH", "/data/proxies.db"),
-		geoipCityDB:      envOrDefault("GEOIP_CITY_DB", "/geoip/GeoLite2-City.mmdb"),
-		geoipASNDB:       envOrDefault("GEOIP_ASN_DB", "/geoip/GeoLite2-ASN.mmdb"),
-		workers:          envOrDefaultInt("WORKERS", 100),
-		timeout:          time.Duration(envOrDefaultInt("TIMEOUT", 10)) * time.Second,
-		testURL:          envOrDefault("TEST_URL", "http://httpbin.org/ip"),
-		originIP:         envOrDefault("ORIGIN_IP", ""),
-		skipBlocklist:    envOrDefaultBool("SKIP_BLOCKLIST", false),
-		batchSize:        envOrDefaultInt("BATCH_SIZE", 500),
-		recheckInterval:  envOrDefaultDuration("RECHECK_INTERVAL", time.Hour),
-		idleSleep:        envOrDefaultDuration("IDLE_SLEEP", time.Minute),
-		failureThreshold: envOrDefaultInt("FAILURE_THRESHOLD", 3),
-		evictAfter:       envOrDefaultDuration("EVICT_AFTER", 7*24*time.Hour),
-		evictInterval:    envOrDefaultDuration("EVICT_INTERVAL", time.Hour),
+		dbPath:            envOrDefault("DB_PATH", "/data/proxies.db"),
+		geoipCityDB:       envOrDefault("GEOIP_CITY_DB", "/geoip/GeoLite2-City.mmdb"),
+		geoipASNDB:        envOrDefault("GEOIP_ASN_DB", "/geoip/GeoLite2-ASN.mmdb"),
+		workers:           envOrDefaultInt("WORKERS", 100),
+		timeout:           time.Duration(envOrDefaultInt("TIMEOUT", 10)) * time.Second,
+		testURL:           envOrDefault("TEST_URL", "http://httpbin.org/ip"),
+		originIP:          envOrDefault("ORIGIN_IP", ""),
+		skipAuxBlocklists: envOrDefaultBool("SKIP_AUX_BLOCKLISTS", false),
+		batchSize:         envOrDefaultInt("BATCH_SIZE", 500),
+		recheckInterval:   envOrDefaultDuration("RECHECK_INTERVAL", time.Hour),
+		idleSleep:         envOrDefaultDuration("IDLE_SLEEP", time.Minute),
+		failureThreshold:  envOrDefaultInt("FAILURE_THRESHOLD", 3),
+		evictAfter:        envOrDefaultDuration("EVICT_AFTER", 7*24*time.Hour),
+		evictInterval:     envOrDefaultDuration("EVICT_INTERVAL", time.Hour),
 	}
 }
 
@@ -99,7 +100,7 @@ func run(logger *slog.Logger) error {
 		"timeout", cfg.timeout,
 		"test_url", cfg.testURL,
 		"origin_ip", cfg.originIP,
-		"skip_blocklist", cfg.skipBlocklist,
+		"skip_aux_blocklists", cfg.skipAuxBlocklists,
 		"batch_size", cfg.batchSize,
 		"recheck_interval", cfg.recheckInterval,
 		"idle_sleep", cfg.idleSleep,
@@ -144,21 +145,25 @@ func run(logger *slog.Logger) error {
 		Logger:   logger,
 	})
 
-	var blChecker *blocklist.Checker
-	if !cfg.skipBlocklist {
-		blChecker = blocklist.NewChecker(blocklist.WithLogger(logger))
-		logger.Info("blocklist checking enabled")
+	efnetChecker := blocklist.NewChecker(blocklist.WithLogger(logger))
+	logger.Info("mandatory EFnet RBL eligibility checking enabled", "list", blocklist.EFnetList)
+
+	var auxBLChecker *blocklist.Checker
+	if !cfg.skipAuxBlocklists {
+		auxBLChecker = blocklist.NewChecker(blocklist.WithLogger(logger))
+		logger.Info("auxiliary blocklist checking enabled")
 	} else {
-		logger.Info("blocklist checking disabled")
+		logger.Info("auxiliary blocklist checking disabled")
 	}
 
 	r := &revalidator{
-		cfg:       cfg,
-		db:        db,
-		checker:   checker,
-		geoip:     geoip,
-		blChecker: blChecker,
-		logger:    logger,
+		cfg:          cfg,
+		db:           db,
+		checker:      checker,
+		geoip:        geoip,
+		efnetChecker: efnetChecker,
+		auxBLChecker: auxBLChecker,
+		logger:       logger,
 	}
 
 	// Eviction sweep runs on its own goroutine independent of the recheck loop
@@ -179,12 +184,13 @@ func run(logger *slog.Logger) error {
 }
 
 type revalidator struct {
-	cfg       config
-	db        *database.DB
-	checker   *proxy.Checker
-	geoip     *proxy.GeoIPLookup
-	blChecker *blocklist.Checker
-	logger    *slog.Logger
+	cfg          config
+	db           *database.DB
+	checker      *proxy.Checker
+	geoip        *proxy.GeoIPLookup
+	efnetChecker *blocklist.Checker
+	auxBLChecker *blocklist.Checker
+	logger       *slog.Logger
 }
 
 func (r *revalidator) recheckLoop(ctx context.Context) {
@@ -274,30 +280,44 @@ func (r *revalidator) processBatch(
 	wg.Wait()
 }
 
-// checkOne re-runs the proxy check against a single (ip, port, protocol) row
-// and records the outcome. Returns true if the matching protocol passed.
-//
-// Note: proxy.Checker.Check tries every protocol on the (ip, port). We use
-// the result for this row's protocol and ignore the others. (We do NOT try
-// to upsert newly discovered protocols here — that path belongs to the
-// candidate validator. Keeping the revalidator narrowly scoped to "did this
-// row's protocol still work" simplifies reasoning about counters and status.)
+// checkOne re-runs exactly the row's stored SOCKS protocol and records the
+// outcome. Endpoint and observed-exit EFnet eligibility must both be
+// conclusively clean before the row can remain active.
 func (r *revalidator) checkOne(ctx context.Context, p proxy.Proxy) bool {
-	results := r.checker.Check(ctx, proxy.Candidate{IP: p.IP, Port: p.Port})
-
-	var match *proxy.CheckResult
-	for i := range results {
-		if results[i].Protocol == p.Protocol && results[i].Alive {
-			match = &results[i]
-			break
-		}
+	endpointEligibility := r.efnetChecker.CheckEFnet(ctx, p.IP)
+	if ctx.Err() != nil {
+		return false
+	}
+	if endpointEligibility.Err != nil || endpointEligibility.Listed {
+		return r.recordEligibilityFailure(p, "endpoint", p.IP, endpointEligibility)
 	}
 
-	if match == nil {
+	match := r.checker.CheckProtocol(ctx, proxy.Candidate{IP: p.IP, Port: p.Port}, p.Protocol)
+	if ctx.Err() != nil {
+		return false
+	}
+	if match == nil || !match.Alive {
 		if err := r.db.RecordCheckFailure(p.ID, r.cfg.failureThreshold); err != nil {
 			r.logger.Error("record failure", "id", p.ID, "ip", p.IP, "port", p.Port, "error", err)
 		}
 		return false
+	}
+
+	exitIP := net.ParseIP(match.ExitIP)
+	if exitIP == nil || exitIP.To4() == nil {
+		return r.recordEligibilityFailure(p, "exit", match.ExitIP, blocklist.LookupResult{
+			List: blocklist.EFnetList,
+			Err:  fmt.Errorf("proxy did not expose an IPv4 exit address"),
+		})
+	}
+	if match.ExitIP != p.IP {
+		exitEligibility := r.efnetChecker.CheckEFnet(ctx, match.ExitIP)
+		if ctx.Err() != nil {
+			return false
+		}
+		if exitEligibility.Err != nil || exitEligibility.Listed {
+			return r.recordEligibilityFailure(p, "exit", match.ExitIP, exitEligibility)
+		}
 	}
 
 	update := database.CheckSuccessUpdate{
@@ -306,10 +326,17 @@ func (r *revalidator) checkOne(ctx context.Context, p proxy.Proxy) bool {
 		ExitIP:          match.ExitIP,
 		SupportsConnect: match.SupportsConnect,
 		TLSInsecure:     match.TLSInsecure,
+		// A prior EFnet rejection must be cleared once the mandatory lookup is
+		// conclusively clean. If auxiliary checks are disabled, preserve any
+		// unrelated auxiliary metadata instead of clearing it implicitly.
+		SetBlocklist: p.Blocklists == blocklist.EFnetList,
 	}
 
-	if r.blChecker != nil {
-		blResult := r.blChecker.Check(ctx, p.IP)
+	if r.auxBLChecker != nil {
+		blResult := r.auxBLChecker.Check(ctx, p.IP)
+		if ctx.Err() != nil {
+			return false
+		}
 		update.SetBlocklist = true
 		update.Blocklisted = blResult.Listed
 		update.Blocklists = blResult.BlocklistsString()
@@ -321,6 +348,39 @@ func (r *revalidator) checkOne(ctx context.Context, p proxy.Proxy) bool {
 	}
 
 	return true
+}
+
+func (r *revalidator) recordEligibilityFailure(p proxy.Proxy, scope, checkedIP string, result blocklist.LookupResult) bool {
+	blocklisted := p.Blocklisted
+	blocklists := p.Blocklists
+	if result.Listed {
+		blocklisted = true
+		blocklists = blocklist.EFnetList
+		r.logger.Info("marking proxy stale after EFnet RBL hit",
+			"id", p.ID,
+			"ip", p.IP,
+			"port", p.Port,
+			"protocol", p.Protocol,
+			"scope", scope,
+			"checked_ip", checkedIP,
+			"responses", result.Addresses,
+		)
+	} else {
+		r.logger.Warn("marking proxy stale after indeterminate EFnet RBL lookup",
+			"id", p.ID,
+			"ip", p.IP,
+			"port", p.Port,
+			"protocol", p.Protocol,
+			"scope", scope,
+			"checked_ip", checkedIP,
+			"error", result.Err,
+		)
+	}
+
+	if err := r.db.RecordEligibilityFailure(p.ID, blocklisted, blocklists); err != nil {
+		r.logger.Error("record eligibility failure", "id", p.ID, "ip", p.IP, "port", p.Port, "error", err)
+	}
+	return false
 }
 
 func (r *revalidator) evictionLoop(ctx context.Context) {

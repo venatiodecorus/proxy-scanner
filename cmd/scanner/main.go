@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,6 +17,8 @@ import (
 	"github.com/venatiodecorus/proxy-scanner/internal/proxy"
 	"github.com/venatiodecorus/proxy-scanner/internal/scanner"
 )
+
+const progressLogInterval = 15 * time.Minute
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -29,7 +34,7 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	scanRate := envOrDefaultInt("SCAN_RATE", 50000)
-	scanPorts := envOrDefault("SCAN_PORTS", "3128,8080,1080,8888,9050,8443,3129,80,443,1081")
+	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,9050")
 	scanAdapter := envOrDefault("SCAN_ADAPTER", "ens3")
 	excludeFile := envOrDefault("EXCLUDE_FILE", "/config/exclude.conf")
 	dbPath := envOrDefault("DB_PATH", "/data/proxies.db")
@@ -96,6 +101,9 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("starting masscan: %w", err)
 	}
 
+	stopProgress := startScannerProgress(logger, db, outputFile, time.Now())
+	defer stopProgress()
+
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
@@ -157,6 +165,75 @@ func run(logger *slog.Logger) error {
 	}
 
 	return parseAndEnqueue(logger, db, outputFile)
+}
+
+// startScannerProgress logs approximate masscan output and queue totals at a
+// low frequency while the scanner process is running.
+func startScannerProgress(logger *slog.Logger, db *database.DB, outputFile string, started time.Time) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(progressLogInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				records, size, err := scanOutputTotals(outputFile)
+				if err != nil {
+					logger.Warn("failed to read scan progress", "file", outputFile, "error", err)
+					continue
+				}
+				pending, err := db.PendingCandidateCount()
+				if err != nil {
+					logger.Warn("failed to read pending candidate total", "error", err)
+				}
+				logger.Info("scanner progress",
+					"elapsed", time.Since(started).Round(time.Second),
+					"masscan_records", records,
+					"output_bytes", size,
+					"pending_in_queue", pending,
+				)
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func scanOutputTotals(outputFile string) (records int64, size int64, err error) {
+	f, err := os.Open(outputFile)
+	if os.IsNotExist(err) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("opening output file: %w", err)
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stating output file: %w", err)
+	}
+
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 64*1024), 1024*1024)
+	for s.Scan() {
+		if bytes.Contains(s.Bytes(), []byte(`"ip"`)) {
+			records++
+		}
+	}
+	if err := s.Err(); err != nil {
+		return 0, st.Size(), fmt.Errorf("counting output records: %w", err)
+	}
+	return records, st.Size(), nil
 }
 
 // outputFileIsFresh reports whether outputFile has been modified since

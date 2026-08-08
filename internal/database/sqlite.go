@@ -328,6 +328,30 @@ func (d *DB) RecordCheckFailure(id int64, failureThreshold int) error {
 	return nil
 }
 
+// RecordEligibilityFailure immediately hides a proxy that fails the mandatory
+// eligibility policy. This bypasses the ordinary consecutive-failure threshold
+// because listed or indeterminate EFnet status must never be considered active.
+// last_ok_at is intentionally preserved so eviction remains based on the last
+// confirmed successful and eligible check.
+func (d *DB) RecordEligibilityFailure(id int64, blocklisted bool, blocklists string) error {
+	now := time.Now().UTC()
+	_, err := d.db.Exec(`
+		UPDATE proxies SET
+			blocklisted          = ?,
+			blocklists           = ?,
+			last_checked_at      = ?,
+			consecutive_failures = consecutive_failures + 1,
+			check_count          = check_count + 1,
+			status               = ?,
+			alive                = FALSE
+		WHERE id = ?
+	`, blocklisted, blocklists, now, proxy.ProxyStatusStale, id)
+	if err != nil {
+		return fmt.Errorf("recording eligibility failure for id %d: %w", id, err)
+	}
+	return nil
+}
+
 // ListProxiesForRecheck returns up to `limit` proxies that haven't been
 // checked within the last minAge duration, ordered by last_checked_at ascending
 // (NULLs first so never-checked rows are picked up immediately). Includes both
@@ -340,10 +364,11 @@ func (d *DB) ListProxiesForRecheck(limit int, minAge time.Duration) ([]proxy.Pro
 		       last_seen, first_seen, alive,
 		       last_checked_at, last_ok_at, consecutive_failures, check_count, success_count, status
 		FROM proxies
-		WHERE last_checked_at IS NULL OR last_checked_at < ?
+		WHERE protocol IN (?, ?)
+		  AND (last_checked_at IS NULL OR last_checked_at < ?)
 		ORDER BY last_checked_at IS NULL DESC, last_checked_at ASC
 		LIMIT ?
-	`, cutoff, limit)
+	`, string(proxy.ProtocolSOCKS4), string(proxy.ProtocolSOCKS5), cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("listing proxies for recheck: %w", err)
 	}
