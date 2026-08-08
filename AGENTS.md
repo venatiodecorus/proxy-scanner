@@ -29,6 +29,7 @@ internal/blocklist/      — DNSBL blocklist checking (dnsbl.go)
 internal/database/       — SQLite operations (sqlite.go) — includes candidates queue + liveness tracking
 internal/scanner/        — Masscan output parser (parser.go)
 data/                    — GeoLite2 .mmdb databases (City, ASN, Country) — committed to repo
+cmd/genexclude/          — Generator for the ASN-derived exclusion lists (dev tool, not shipped)
 config/exclude/          — Modular CIDR exclusion lists (merged at Docker build time)
 docker/                  — Dockerfiles for all four images
 docker-compose.yml       — Docker Compose configuration
@@ -65,7 +66,7 @@ docker-compose.yml       — Docker Compose configuration
 - `SCAN_RATE` — Masscan packets per second (default: `50000`)
 - `SCAN_PORTS` — Comma-separated SOCKS port list (default: `1080,1081,9050`)
 - `SCAN_ADAPTER` — Network interface for masscan (default: `ens3`)
-- `EXCLUDE_FILE` — Path to CIDR exclusion file (default: `/config/exclude.conf`)
+- `EXCLUDE_FILE` — Path to CIDR exclusion file (default: `/config/exclude.conf`). Validated at start-up; the scanner refuses to run if the file is missing, short, malformed, or fails a canary check. See "Fail-closed validation" below.
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
 - `OUTPUT_FILE` — Path for masscan JSON output (default: `/data/candidates.json`)
 - `RESUME_FILE` — Path for masscan resume state file (default: `/data/paused.conf`). If this file exists at startup, the scanner resumes the previous scan from this state.
@@ -124,17 +125,35 @@ The API filters by proxy status. Default is `?status=active` (only proxies that 
 
 ## Exclusion List Management
 
-The scan exclusion list is split into modular files under `config/exclude/`:
+Masscan is invoked against `0.0.0.0/0`. There is no allowlist, so the exclusion list is the only thing keeping the scan off networks it must not touch. Treat these files and the code that validates them as safety-critical.
+
+The list is split into modular files under `config/exclude/`:
 
 - `00-iana-special.conf` — IANA Special-Purpose Address Registry (RFC 6890). Non-negotiable; these are non-routable.
-- `10-military.conf` — US DoD/military allocations. Do not scan.
-- `20-cloud-providers.conf` — Our hosting provider (Hetzner). Avoids self-scanning and abuse complaints.
+- `10-military.conf` — Military /8 allocations (US DoD legacy /8s plus UK MOD `25.0.0.0/8`). Whole /8s only.
+- `11-military-asn.conf` — **GENERATED.** Military/defense networks by ASN organisation name. This is what covers the hundreds of DoD/Air Force/Navy prefixes outside the /8s.
+- `12-government-asn.conf` — **GENERATED.** Federal, state, municipal and foreign government networks; law enforcement and intelligence agencies.
+- `20-cloud-providers.conf` — Hand-written Hetzner supernets. Known incomplete; kept only as a backstop.
+- `21-selfhost-asn.conf` — **GENERATED.** Complete hosting-provider self-exclusion by ASN.
 - `30-infrastructure.conf` — Root DNS, IXPs, RIR infrastructure. Critical internet infra.
 - `90-custom.conf` — Manual additions from abuse complaints or opt-out requests.
 
 Files are numbered so they merge in predictable order via `cat config/exclude/*.conf`. The Dockerfile strips comments and blank lines at build time to produce a clean CIDR-only file for masscan.
 
-**To add a new exclusion**: Add the CIDR to the appropriate file (usually `90-custom.conf`), commit, push. The scanner image rebuilds automatically via GitHub Actions.
+**Never hand-edit a `*-asn.conf` file.** Regenerate with `go run ./cmd/genexclude` (see `cmd/genexclude/main.go` for the organisation-name regexps and the short false-positive denylist). Use `-list-orgs <military|government|selfhost>` to audit which organisations matched. Regenerate after refreshing `data/GeoLite2-ASN.mmdb`.
+
+**Bias toward over-excluding.** A false positive costs one proxy candidate; a false negative means scanning a military or government network.
+
+**To add a new exclusion**: Add the CIDR to `90-custom.conf`, commit, push. The scanner image rebuilds automatically via GitHub Actions. Exclusions are baked in at build time, so an opt-out only takes effect once the new image rolls out.
+
+### Fail-closed validation
+
+Do not weaken either of these, and do not add a flag to bypass them:
+
+- `docker/Dockerfile.scanner` fails the image build if the merged list has fewer than `MIN_EXCLUDE_ENTRIES` (2000) entries.
+- `cmd/scanner/exclude.go` re-validates at start-up before masscan runs: the file must parse cleanly, clear the same floor, and cover every address in `excludeCanaries` — one canary per fragment, so an unmerged fragment is detected rather than assumed present. Add a canary when you add a fragment.
+
+`TestCommittedExcludeListPassesPreflight` in `cmd/scanner/exclude_test.go` runs the runtime validation against the real committed files, so CI catches an unsafe list before it ships.
 
 ## Deployment Notes
 
@@ -147,4 +166,4 @@ Files are numbered so they merge in predictable order via `cat config/exclude/*.
 - For incremental weekly scanning: Set `SCAN_TIMEOUT` (e.g. `4h`) so masscan saves state on timeout. Next run resumes automatically via `/data/paused.conf`.
 - All four components share a named Docker volume `scanner-data` mounted at `/data`.
 - SQLite WAL mode allows concurrent reads (API) and writes from validator + revalidator. The single-writer constraint is handled by `_busy_timeout=5000` and per-process connections; transient `SQLITE_BUSY` retries are expected during heavy validator runs.
-- Rate limit masscan to 50k pps to avoid abuse complaints.
+- Rate limit masscan to 50k pps to avoid abuse complaints. `docker-compose.yml` must not exceed this; higher rates also cause packet loss on Hetzner Cloud's shared NICs, which silently costs coverage.

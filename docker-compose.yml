@@ -28,7 +28,10 @@ services:
     volumes:
       - scanner-data:/data
     environment:
-      SCAN_RATE: "100000"
+      # Keep in step with the 50k pps ceiling documented in AGENTS.md and the
+      # README. Higher rates are the main driver of abuse complaints and of
+      # packet loss on Hetzner Cloud's shared NICs.
+      SCAN_RATE: "50000"
       SCAN_PORTS: "1080,1081,9050"
       SCAN_ADAPTER: "ens3"
       DB_PATH: /data/proxies.db

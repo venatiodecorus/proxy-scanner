@@ -273,8 +273,11 @@ data/
 config/
   exclude/                   Modular CIDR exclusion lists (merged at build time)
     00-iana-special.conf      IANA Special-Purpose Address Registry (RFC 6890)
-    10-military.conf          US DoD/military networks
-    20-cloud-providers.conf   Hetzner (self-exclusion)
+    10-military.conf          Military /8 allocations (hand-maintained)
+    11-military-asn.conf      Military/defense networks by ASN org (GENERATED)
+    12-government-asn.conf    Government networks by ASN org (GENERATED)
+    20-cloud-providers.conf   Hetzner supernets (hand-maintained backstop)
+    21-selfhost-asn.conf      Hosting provider self-exclusion by ASN (GENERATED)
     30-infrastructure.conf    Root DNS, IXPs, RIR infrastructure
     90-custom.conf            Manual additions (abuse complaints)
 docker/
@@ -297,13 +300,41 @@ No additional secrets or configuration required. The workflow uses the built-in 
 
 ## Scan Exclusion List
 
-Networks are excluded from scanning via modular config files in `config/exclude/`. The scanner Dockerfile merges them at build time.
+The scanner targets `0.0.0.0/0`. There is no allowlist — the exclusion list is the *only* thing keeping the scan off networks it must not touch, so treat it as a safety-critical component.
+
+Networks are excluded via modular config files in `config/exclude/`, which the scanner Dockerfile merges at build time (~7,500 entries covering roughly 7% of IPv4).
+
+### Hand-maintained vs. generated
+
+`00-iana-special.conf`, `10-military.conf`, `20-cloud-providers.conf`, `30-infrastructure.conf` and `90-custom.conf` are edited by hand.
+
+The `*-asn.conf` files are **generated** and must not be hand-edited. They are derived from ASN organisation names in `data/GeoLite2-ASN.mmdb`, because hand-curated lists can only realistically cover whole /8s — and military organisations hold many hundreds of smaller prefixes outside those /8s (US DoD ASNs alone announce ~1000 prefixes, mostly /16s scattered through `128.0.0.0/3`).
+
+```sh
+go run ./cmd/genexclude                       # regenerate the *-asn.conf files
+go run ./cmd/genexclude -list-orgs military    # audit which organisations matched
+```
+
+Regenerate whenever `data/GeoLite2-ASN.mmdb` is refreshed, and review the diff before committing.
+
+### Fail-closed validation
+
+Two independent checks guard against shipping or running a broken exclusion list:
+
+- **Build time** — `docker/Dockerfile.scanner` fails the build if the merged file has fewer than `MIN_EXCLUDE_ENTRIES` (2000) entries.
+- **Start-up** — `cmd/scanner/exclude.go` re-validates before masscan sends a packet: the file must parse cleanly, clear the same entry-count floor, and *cover a set of canary addresses* drawn from every fragment (RFC1918, US DoD /8, UK MOD /8, a DoD /16, Navy, Air Force, US House of Representatives, FAA, our own provider, a root nameserver). If any canary is uncovered, the scan aborts with an error naming it.
+
+`TestCommittedExcludeListPassesPreflight` runs that same validation against the real committed files in CI.
+
+### Adding an exclusion
 
 To add a new exclusion (e.g., after an abuse complaint):
 
 1. Add the CIDR to `config/exclude/90-custom.conf`
 2. Commit and push to main
 3. GitHub Actions rebuilds the scanner image
+
+Note that exclusions are baked into the image at build time, so an opt-out only takes effect once the rebuilt image rolls out.
 
 ## Environment Variables
 

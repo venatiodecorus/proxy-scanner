@@ -53,6 +53,13 @@ func run(logger *slog.Logger) error {
 		"scan_timeout", scanTimeout,
 	)
 
+	// Fail closed: we scan 0.0.0.0/0, so an incomplete or missing exclusion list
+	// means scanning military, government and infrastructure networks. Validate
+	// before masscan gets a chance to send a single packet.
+	if err := validateExcludeFile(excludeFile, logger); err != nil {
+		return fmt.Errorf("exclude file preflight failed: %w", err)
+	}
+
 	db, err := database.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
