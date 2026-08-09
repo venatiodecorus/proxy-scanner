@@ -1,8 +1,24 @@
 # Proxy Scanner — Implementation Plan
 
+> **Historical document — superseded in the deployment sections.**
+>
+> This records the original plan and the phase-by-phase build-out. The
+> application design (scanner → candidate queue → validator → SQLite → API,
+> plus the revalidator) still matches reality, but **the deployment story
+> below does not.**
+>
+> There is no Kubernetes, no k3s cluster, no FluxCD, and no PVC. The system runs
+> as Docker containers on a single Debian host, scheduled by systemd timers.
+> References to CronJobs, PVCs, GitOps reconciliation and a `deploy/` directory
+> of Kubernetes manifests are all obsolete — note that `deploy/` now holds the
+> systemd units and host install scripts instead.
+>
+> For how this is actually deployed and operated, read
+> [`deploy/README.md`](deploy/README.md) and the README.
+
 ## Overview
 
-A Kubernetes-native system that scans the public IPv4 space for open SOCKS4/SOCKS5 proxies, validates them behind a mandatory EFnet RBL eligibility gate, tests speed, and exposes verified proxies via a REST API. Deployed via GitOps (FluxCD) on a Hetzner Cloud k3s cluster.
+A system that scans the public IPv4 space for open SOCKS4/SOCKS5 proxies, validates them behind a mandatory EFnet RBL eligibility gate, tests speed, and exposes verified proxies via a REST API.
 
 ## Architecture
 
@@ -42,7 +58,7 @@ A Kubernetes-native system that scans the public IPv4 space for open SOCKS4/SOCK
 
 ### 1. Scanner (masscan CronJob)
 - Alpine-based container with masscan
-- Scans `0.0.0.0/0` minus excluded ranges at 50k pps (~24h full sweep)
+- Scans `0.0.0.0/0` minus excluded ranges at 50k pps (~56h full sweep across 3 ports; see README "How long a full sweep takes")
 - Targets SOCKS ports: 1080, 1081, 9050
 - Outputs JSON to shared PVC
 - Triggers validator job on completion
@@ -168,7 +184,7 @@ Published to GHCR:
 
 ## Key Design Decisions
 
-1. **50k pps scan rate** — Conservative for Hetzner Cloud shared NICs. Full IPv4 sweep in ~24h, fits weekly cadence.
+1. **50k pps scan rate** — Conservative for Hetzner Cloud shared NICs. A full IPv4 sweep is ~56h of masscan time across the 3 SOCKS ports (the original ~24h figure assumed a single port), so with `SCAN_TIMEOUT=4h` and the daily cron a sweep completes about every 14 days.
 2. **SQLite over PostgreSQL** — Write-once-read-many workload. Single writer (validator), single reader (API). WAL mode enables concurrent access. Dataset (50k-200k proxies) fits trivially.
 3. **Separate scan/validate phases** — Masscan excels at raw port discovery. Go excels at concurrent proxy negotiation. Each can be debugged independently.
 4. **CronJob + Job over Deployment** — Batch workloads with clear start/end. No wasted resources between runs.
@@ -253,4 +269,7 @@ Published to GHCR:
 - [x] `90-custom.conf` — Empty template with instructions for adding abuse-complaint exclusions
 - [x] Dockerfile.scanner updated: merges all `config/exclude/*.conf` at build time into a single clean CIDR file
 - [x] 88 unique exclusion entries across all categories, zero duplicates
-- [x] Adding exclusions is pure GitOps: edit file, commit, push, image rebuilds, FluxCD deploys
+      *(superseded: the generated `*-asn.conf` lists brought this to ~7,600 entries)*
+- [x] Adding exclusions: edit file, commit, push, image rebuilds
+      *(superseded: the rollout is not automatic — the host must pull the new
+      image with `update.sh` before the exclusion takes effect)*

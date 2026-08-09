@@ -75,6 +75,8 @@ func (d *DB) migrate() error {
 		check_count          INTEGER NOT NULL DEFAULT 0,
 		success_count        INTEGER NOT NULL DEFAULT 0,
 		status               TEXT NOT NULL DEFAULT 'active',
+		last_served_at       DATETIME,
+		serve_count          INTEGER NOT NULL DEFAULT 0,
 		UNIQUE(ip, port, protocol)
 	);
 
@@ -93,6 +95,8 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_proxies_blocklisted ON proxies(alive, blocklisted);
 	CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(status, protocol);
 	CREATE INDEX IF NOT EXISTS idx_proxies_last_checked ON proxies(last_checked_at);
+	-- Supports the rotating endpoint's "least recently served first" ordering.
+	CREATE INDEX IF NOT EXISTS idx_proxies_rotation ON proxies(status, last_served_at);
 
 	CREATE TABLE IF NOT EXISTS candidates (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +134,8 @@ func (d *DB) migrate() error {
 		{"check_count", "ALTER TABLE proxies ADD COLUMN check_count INTEGER NOT NULL DEFAULT 0"},
 		{"success_count", "ALTER TABLE proxies ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0"},
 		{"status", "ALTER TABLE proxies ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"},
+		{"last_served_at", "ALTER TABLE proxies ADD COLUMN last_served_at DATETIME"},
+		{"serve_count", "ALTER TABLE proxies ADD COLUMN serve_count INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var exists int
 		if err := d.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name = ?", m.name).Scan(&exists); err != nil {
@@ -358,11 +364,10 @@ func (d *DB) RecordEligibilityFailure(id int64, blocklisted bool, blocklists str
 // active and stale proxies — stale ones get a chance to come back.
 func (d *DB) ListProxiesForRecheck(limit int, minAge time.Duration) ([]proxy.Proxy, error) {
 	cutoff := time.Now().UTC().Add(-minAge)
+	// Uses proxyColumns rather than an inline list so this query cannot drift out
+	// of sync with scanProxy when a column is added.
 	rows, err := d.db.Query(`
-		SELECT id, ip, port, protocol, anonymity, country, city, asn, asn_org, exit_ip,
-		       latency_ms, supports_connect, tls_insecure, blocklisted, blocklists,
-		       last_seen, first_seen, alive,
-		       last_checked_at, last_ok_at, consecutive_failures, check_count, success_count, status
+		SELECT `+proxyColumns+`
 		FROM proxies
 		WHERE protocol IN (?, ?)
 		  AND (last_checked_at IS NULL OR last_checked_at < ?)
@@ -548,7 +553,8 @@ func (d *DB) MarkAllDead() error {
 const proxyColumns = `id, ip, port, protocol, anonymity, country, city, asn, asn_org, exit_ip,
 		latency_ms, supports_connect, tls_insecure, blocklisted, blocklists,
 		last_seen, first_seen, alive,
-		last_checked_at, last_ok_at, consecutive_failures, check_count, success_count, status`
+		last_checked_at, last_ok_at, consecutive_failures, check_count, success_count, status,
+		last_served_at, serve_count`
 
 // GetProxy returns a single proxy by ID.
 func (d *DB) GetProxy(id int64) (*proxy.Proxy, error) {
@@ -614,6 +620,52 @@ func (d *DB) RandomProxy(f proxy.ProxyFilter) (*proxy.Proxy, error) {
 
 	row := d.db.QueryRow(query, args...)
 	return scanProxy(row)
+}
+
+// RotateProxy returns the least-recently-served proxy matching the filter and
+// atomically stamps it as served. Repeated calls therefore walk the whole
+// matching pool before repeating any entry, which is what makes this a rotating
+// endpoint rather than a random one — RandomProxy samples with replacement and
+// can hand out the same proxy twice in a row.
+//
+// Ordering is "never served first, then oldest served first". The claim and the
+// stamp happen in a single UPDATE ... RETURNING so two concurrent callers cannot
+// be handed the same proxy: SQLite serialises the writes, and the loser of the
+// race re-evaluates the subquery and picks the next candidate.
+//
+// Returns (nil, nil) when nothing matches the filter.
+func (d *DB) RotateProxy(f proxy.ProxyFilter) (*proxy.Proxy, error) {
+	where, args := buildWhere(f)
+	if where == "" {
+		where = "1=1"
+	}
+
+	// The RETURNING clause needs unqualified column names, which is why this
+	// reuses proxyColumns verbatim.
+	query := `
+		UPDATE proxies
+		SET last_served_at = ?,
+		    serve_count    = serve_count + 1
+		WHERE id = (
+			SELECT id FROM proxies
+			WHERE ` + where + `
+			ORDER BY last_served_at IS NOT NULL, last_served_at ASC, id ASC
+			LIMIT 1
+		)
+		RETURNING ` + proxyColumns
+
+	// The timestamp arg comes before the filter args because SET precedes WHERE.
+	queryArgs := append([]interface{}{time.Now().UTC()}, args...)
+
+	row := d.db.QueryRow(query, queryArgs...)
+	p, err := scanProxy(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("rotating proxy: %w", err)
+	}
+	return p, nil
 }
 
 // Stats returns aggregate statistics about the proxy database.
@@ -795,14 +847,15 @@ func scanProxy(s scannable) (*proxy.Proxy, error) {
 	var latencyMs, asn sql.NullInt64
 	var supportsConnect, tlsInsecure, blocklisted, alive sql.NullBool
 	var blocklists, status sql.NullString
-	var lastCheckedAt, lastOkAt sql.NullTime
-	var consecutiveFailures, checkCount, successCount sql.NullInt64
+	var lastCheckedAt, lastOkAt, lastServedAt sql.NullTime
+	var consecutiveFailures, checkCount, successCount, serveCount sql.NullInt64
 	err := s.Scan(
 		&p.ID, &p.IP, &p.Port, &protocol, &anonymity,
 		&country, &city, &asn, &asnOrg, &exitIP, &latencyMs,
 		&supportsConnect, &tlsInsecure, &blocklisted, &blocklists,
 		&p.LastSeen, &p.FirstSeen, &alive,
 		&lastCheckedAt, &lastOkAt, &consecutiveFailures, &checkCount, &successCount, &status,
+		&lastServedAt, &serveCount,
 	)
 	if err != nil {
 		return nil, err
@@ -858,6 +911,13 @@ func scanProxy(s scannable) (*proxy.Proxy, error) {
 	}
 	if successCount.Valid {
 		p.SuccessCount = int(successCount.Int64)
+	}
+	if lastServedAt.Valid {
+		t := lastServedAt.Time
+		p.LastServedAt = &t
+	}
+	if serveCount.Valid {
+		p.ServeCount = int(serveCount.Int64)
 	}
 	if status.Valid && status.String != "" {
 		p.Status = status.String

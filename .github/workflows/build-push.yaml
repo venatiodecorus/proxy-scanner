@@ -5,6 +5,8 @@ on:
     branches: [main, master]
     paths-ignore:
       - "**.md"
+      # Deployment scripts and systemd units do not affect image contents.
+      - "deploy/**"
       - "infra/**"
       - "LICENSE"
   workflow_dispatch:
@@ -184,22 +186,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    needs: [build-scanner, build-validator, build-api, build-revalidator]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Deploy to VPS
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: deploy
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            cd /opt/proxy-scanner
-            # --profile scan is required to pull profile-gated services
-            # (scanner, validator). Without it, Compose silently skips them
-            # and they go stale on the VPS.
-            docker compose --profile scan pull
-            docker compose up -d api revalidator
-            docker image prune -f
+# There is deliberately no deploy job. CI builds and pushes images to GHCR; the
+# scanner host pulls them itself with `deploy/update.sh`. The previous job SSHed
+# into the VPS as a `deploy` user, which meant CI held a key with
+# root-equivalent access (docker group) to the scanner box.

@@ -1,16 +1,24 @@
+# Host-specific values are read from a .env file sitting next to this compose
+# file (Compose picks it up automatically). See deploy/env.example. The defaults
+# below are the safe choices for an unconfigured host, not the production ones.
 services:
   api:
     image: ghcr.io/venatiodecorus/proxy-scanner-api:latest
     container_name: proxy-scanner-api
     restart: unless-stopped
     ports:
-      - "100.74.109.25:8080:8080"
+      # Defaults to loopback so a fresh box never publishes the API to the
+      # internet by accident. Set API_BIND_ADDR to the host's Tailscale address
+      # to reach it from the tailnet.
+      - "${API_BIND_ADDR:-127.0.0.1}:${API_PORT:-8080}:8080"
     volumes:
       - scanner-data:/data
     environment:
       DB_PATH: /data/proxies.db
       LISTEN_ADDR: ":8080"
-      # API_TOKEN: "changeme-proxy-scanner-2026"  # uncomment to enable auth
+      # Set API_TOKEN in .env to require a Bearer token on every route except
+      # /v1/health. Empty means auth is disabled.
+      API_TOKEN: "${API_TOKEN:-}"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/health"]
       interval: 30s
@@ -31,9 +39,13 @@ services:
       # Keep in step with the 50k pps ceiling documented in AGENTS.md and the
       # README. Higher rates are the main driver of abuse complaints and of
       # packet loss on Hetzner Cloud's shared NICs.
-      SCAN_RATE: "50000"
-      SCAN_PORTS: "1080,1081,9050"
-      SCAN_ADAPTER: "ens3"
+      SCAN_RATE: "${SCAN_RATE:-50000}"
+      SCAN_PORTS: "${SCAN_PORTS:-1080,1081,9050}"
+      # Leave empty to let masscan pick the default-route interface. Set it in
+      # .env only if that guess is wrong (the old hardcoded "ens3" was an
+      # OpenStack-ism and does not exist on Debian, where it is usually eth0
+      # or enp1s0).
+      SCAN_ADAPTER: "${SCAN_ADAPTER:-}"
       DB_PATH: /data/proxies.db
       OUTPUT_FILE: /data/candidates.json
       RESUME_FILE: /data/paused.conf

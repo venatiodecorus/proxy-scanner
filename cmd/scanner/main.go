@@ -35,7 +35,11 @@ func main() {
 func run(logger *slog.Logger) error {
 	scanRate := envOrDefaultInt("SCAN_RATE", 50000)
 	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,9050")
-	scanAdapter := envOrDefault("SCAN_ADAPTER", "ens3")
+	// Empty means "let masscan pick the default-route interface". There is
+	// deliberately no default here: hardcoding an interface name (it used to be
+	// the OpenStack-specific "ens3") makes the scanner fail on any host that
+	// names its NIC differently.
+	scanAdapter := os.Getenv("SCAN_ADAPTER")
 	excludeFile := envOrDefault("EXCLUDE_FILE", "/config/exclude.conf")
 	dbPath := envOrDefault("DB_PATH", "/data/proxies.db")
 	outputFile := envOrDefault("OUTPUT_FILE", "/data/candidates.json")
@@ -66,16 +70,13 @@ func run(logger *slog.Logger) error {
 	}
 	defer db.Close()
 
-	masscanArgs := []string{
-		"0.0.0.0/0",
-		"-p" + scanPorts,
-		"--excludefile", excludeFile,
-		"--rate", strconv.Itoa(scanRate),
-		"--adapter", scanAdapter,
-		"--open",
-		"-oJ", outputFile,
-		"--source-port", "40000-56383",
-	}
+	masscanArgs := buildMasscanArgs(masscanConfig{
+		ports:       scanPorts,
+		excludeFile: excludeFile,
+		rate:        scanRate,
+		adapter:     scanAdapter,
+		outputFile:  outputFile,
+	})
 
 	resuming := false
 	if _, err := os.Stat(resumeFile); err == nil {
@@ -172,6 +173,39 @@ func run(logger *slog.Logger) error {
 	}
 
 	return parseAndEnqueue(logger, db, outputFile)
+}
+
+// masscanConfig is the set of knobs that shape the masscan command line.
+type masscanConfig struct {
+	ports       string
+	excludeFile string
+	rate        int
+	adapter     string
+	outputFile  string
+}
+
+// buildMasscanArgs assembles the masscan invocation. The target is always
+// 0.0.0.0/0 and --excludefile is always present — the exclusion list, validated
+// separately by validateExcludeFile, is what keeps that target safe.
+//
+// adapter is optional: when empty, the flag is omitted entirely and masscan
+// picks the default-route interface itself. Passing a wrong interface name is a
+// hard failure, so "unset" has to mean "auto-detect" rather than some guess
+// baked into the binary.
+func buildMasscanArgs(cfg masscanConfig) []string {
+	args := []string{
+		"0.0.0.0/0",
+		"-p" + cfg.ports,
+		"--excludefile", cfg.excludeFile,
+		"--rate", strconv.Itoa(cfg.rate),
+		"--open",
+		"-oJ", cfg.outputFile,
+		"--source-port", "40000-56383",
+	}
+	if cfg.adapter != "" {
+		args = append(args, "--adapter", cfg.adapter)
+	}
+	return args
 }
 
 // startScannerProgress logs approximate masscan output and queue totals at a

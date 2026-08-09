@@ -1,0 +1,27 @@
+# Long-running services: the API and the revalidator.
+#
+# Compose already marks these `restart: unless-stopped`, so Docker restarts them
+# on its own. This unit exists so that the desired state is declared in one
+# place and survives a reboot even if the containers were removed by hand.
+[Unit]
+Description=Proxy scanner API and revalidator
+Documentation=https://github.com/venatiodecorus/proxy-scanner
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/proxy-scanner
+# Compose reads /opt/proxy-scanner/.env itself for ${VAR} substitution, so there
+# is deliberately no EnvironmentFile= here — one source of truth.
+ExecStart=/usr/bin/docker compose up -d --remove-orphans api revalidator
+ExecStop=/usr/bin/docker compose stop api revalidator
+ExecReload=/usr/bin/docker compose up -d --remove-orphans api revalidator
+# Pulling images on a cold start can be slow; the default 90s is not enough.
+TimeoutStartSec=15min
+SyslogIdentifier=proxy-scanner
+
+[Install]
+WantedBy=multi-user.target

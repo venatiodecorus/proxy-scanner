@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily proxy scanner validation sweep (safety net)
+Documentation=https://github.com/venatiodecorus/proxy-scanner
+
+[Timer]
+# The validator normally runs via OnSuccess= the instant a scan session ends.
+# This timer only matters when a scan was skipped or failed but candidates are
+# still queued — an empty queue makes the run a no-op that exits immediately.
+# 07:00 UTC is after the 02:00 scan window closes at ~06:00.
+OnCalendar=*-*-* 07:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=proxy-scanner-validate.service
+
+[Install]
+WantedBy=timers.target

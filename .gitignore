@@ -1,48 +1,69 @@
-# Binaries
+# ---- Compiled binaries ----
+# `go build ./cmd/<name>/` drops the binary in the repo root, so these are
+# anchored with a leading slash. Without the anchor, a bare pattern like
+# `validator` also matches the cmd/validator/ SOURCE directory and silently
+# ignores every new file added to it.
 /bin/
+/api
+/genexclude
+/revalidator
+/scanner
+/validator
+
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Test binary
+# Test binaries and coverage profiles
 *.test
-
-# Output of go coverage
 *.out
 
 # Go workspace
 go.work
 go.work.sum
 
-# IDE
+# ---- Editors / IDEs ----
+# Note: .zed/ is intentionally NOT ignored — debug.json and settings.json are
+# committed so the shared debug configuration works for everyone.
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# ---- OS cruft ----
 .DS_Store
 Thumbs.db
 
-# Data files (local dev)
+# ---- Local runtime data ----
+# In the containers these live under /data; running a component locally writes
+# them to the working directory instead.
 *.db
+*.db-shm
+*.db-wal
 candidates.json
+paused.conf
 
-# GeoLite2 tarballs (extracted .mmdb files in data/ are tracked)
+# GeoLite2 tarballs (the extracted .mmdb files in data/ are tracked)
 GeoLite2-*.tar.gz
 
 # Build artifacts
 dist/
 
-# OpenStack credentials
+# ---- Secrets ----
+# OpenStack credentials — never commit.
 openrc.sh
 
-# Terraform
+# Host config for the deployed stack. deploy/env.example is the tracked template;
+# a real .env may hold API_TOKEN.
+.env
+.env.*
+!deploy/env.example
+
+# ---- Terraform ----
 infra/.terraform/
-infra/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfvars
@@ -52,6 +73,12 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+# NOTE: .terraform.lock.hcl is conventionally COMMITTED so provider versions are
+# reproducible across machines. It is ignored here deliberately; drop this line
+# and commit the lock file if you want pinned providers.
+infra/.terraform.lock.hcl
 
+# Deprecated local-only test script — never committed, and deliberately kept
+# that way. It scans 0.0.0.0/0 with an inline RFC1918-only exclusion list, so it
+# bypasses everything in config/exclude/ and the scanner's preflight checks.
 /scan.sh
-validator

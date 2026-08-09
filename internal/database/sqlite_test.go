@@ -949,3 +949,250 @@ func TestCandidateQueueEndToEnd(t *testing.T) {
 		t.Errorf("expected 3 re-enqueued after deletion, got %d", enqueued)
 	}
 }
+
+// seedProxies inserts n SOCKS5 proxies on sequential ports and returns them.
+func seedProxies(t *testing.T, db *DB, n int) []proxy.Proxy {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		p := &proxy.Proxy{
+			IP:        "10.0.0.1",
+			Port:      1080 + i,
+			Protocol:  proxy.ProtocolSOCKS5,
+			Country:   "US",
+			LatencyMs: 100 + i,
+			Alive:     true,
+		}
+		if err := db.UpsertProxy(p); err != nil {
+			t.Fatalf("upserting proxy %d: %v", i, err)
+		}
+	}
+	proxies, err := db.ListProxies(proxy.ProxyFilter{Status: "all"})
+	if err != nil {
+		t.Fatalf("listing seeded proxies: %v", err)
+	}
+	if len(proxies) != n {
+		t.Fatalf("expected %d seeded proxies, got %d", n, len(proxies))
+	}
+	return proxies
+}
+
+// TestRotateProxyCyclesWholePool is the core contract: successive calls must walk
+// every proxy in the pool before repeating any of them.
+func TestRotateProxyCyclesWholePool(t *testing.T) {
+	db := mustOpen(t)
+	const n = 5
+	seedProxies(t, db, n)
+
+	seen := map[int64]int{}
+	for i := 0; i < n; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{})
+		if err != nil {
+			t.Fatalf("rotate %d: %v", i, err)
+		}
+		if p == nil {
+			t.Fatalf("rotate %d returned nil with %d proxies available", i, n)
+		}
+		seen[p.ID]++
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct proxies over %d calls, got %d (%v)", n, n, len(seen), seen)
+	}
+
+	// The next full cycle must cover the pool again, in the same order.
+	for i := 0; i < n; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{})
+		if err != nil {
+			t.Fatalf("second cycle rotate %d: %v", i, err)
+		}
+		seen[p.ID]++
+	}
+	for id, count := range seen {
+		if count != 2 {
+			t.Errorf("proxy %d served %d times over two full cycles, want 2", id, count)
+		}
+	}
+}
+
+func TestRotateProxyNeverServedFirst(t *testing.T) {
+	db := mustOpen(t)
+	proxies := seedProxies(t, db, 3)
+
+	// Mark the first proxy as served long ago; the other two have never been
+	// served and must both come out before it is revisited.
+	if _, err := db.db.Exec("UPDATE proxies SET last_served_at = ? WHERE id = ?",
+		time.Now().UTC().Add(-24*time.Hour), proxies[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == proxies[0].ID {
+		t.Fatalf("expected a never-served proxy first, got the previously served one (id %d)", first.ID)
+	}
+	second, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == proxies[0].ID {
+		t.Fatalf("expected the other never-served proxy second, got id %d", second.ID)
+	}
+	third, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.ID != proxies[0].ID {
+		t.Fatalf("expected the previously served proxy third, got id %d", third.ID)
+	}
+}
+
+func TestRotateProxyStampsServeMetadata(t *testing.T) {
+	db := mustOpen(t)
+	seedProxies(t, db, 1)
+
+	before := time.Now().UTC().Add(-time.Second)
+	p, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ServeCount != 1 {
+		t.Errorf("expected serve_count 1 on first rotation, got %d", p.ServeCount)
+	}
+	if p.LastServedAt == nil {
+		t.Fatal("expected last_served_at to be set")
+	}
+	if p.LastServedAt.Before(before) {
+		t.Errorf("last_served_at %v is older than the start of the test %v", p.LastServedAt, before)
+	}
+
+	p2, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.ServeCount != 2 {
+		t.Errorf("expected serve_count 2 on second rotation, got %d", p2.ServeCount)
+	}
+}
+
+func TestRotateProxyRespectsFilters(t *testing.T) {
+	db := mustOpen(t)
+	seedProxies(t, db, 2)
+
+	// Add a SOCKS4 proxy in a different country.
+	if err := db.UpsertProxy(&proxy.Proxy{
+		IP: "10.0.0.2", Port: 1081, Protocol: proxy.ProtocolSOCKS4,
+		Country: "DE", LatencyMs: 50, Alive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 4; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{Protocol: proxy.ProtocolSOCKS4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p == nil {
+			t.Fatal("expected the socks4 proxy, got nil")
+		}
+		if p.Protocol != proxy.ProtocolSOCKS4 {
+			t.Fatalf("filter ignored: got protocol %s", p.Protocol)
+		}
+	}
+
+	p, err := db.RotateProxy(proxy.ProxyFilter{Country: "DE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p == nil || p.Country != "DE" {
+		t.Fatalf("expected a DE proxy, got %+v", p)
+	}
+}
+
+func TestRotateProxyExcludesStale(t *testing.T) {
+	db := mustOpen(t)
+	proxies := seedProxies(t, db, 2)
+
+	if _, err := db.db.Exec("UPDATE proxies SET status = 'stale' WHERE id = ?", proxies[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{Status: proxy.ProxyStatusActive})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p == nil {
+			t.Fatal("expected the active proxy")
+		}
+		if p.ID == proxies[0].ID {
+			t.Fatal("rotation returned a stale proxy when filtering for active")
+		}
+	}
+}
+
+func TestRotateProxyEmptyPool(t *testing.T) {
+	db := mustOpen(t)
+	p, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatalf("expected no error on empty pool, got %v", err)
+	}
+	if p != nil {
+		t.Fatalf("expected nil proxy on empty pool, got %+v", p)
+	}
+}
+
+func TestRotateProxyNoMatchingFilter(t *testing.T) {
+	db := mustOpen(t)
+	seedProxies(t, db, 2)
+
+	p, err := db.RotateProxy(proxy.ProxyFilter{Country: "ZZ"})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if p != nil {
+		t.Fatalf("expected nil for a filter matching nothing, got %+v", p)
+	}
+}
+
+// TestRotateProxyConcurrent asserts that concurrent callers never receive the
+// same proxy: the claim and the serve stamp happen in one statement.
+func TestRotateProxyConcurrent(t *testing.T) {
+	db := mustOpen(t)
+	const n = 20
+	seedProxies(t, db, n)
+
+	type result struct {
+		id  int64
+		err error
+	}
+	results := make(chan result, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			p, err := db.RotateProxy(proxy.ProxyFilter{})
+			if err != nil || p == nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{id: p.ID}
+		}()
+	}
+	close(start)
+
+	seen := map[int64]bool{}
+	for i := 0; i < n; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("concurrent rotate failed: %v", r.err)
+		}
+		if r.id == 0 {
+			t.Fatal("concurrent rotate returned no proxy while the pool was non-empty")
+		}
+		if seen[r.id] {
+			t.Fatalf("proxy %d handed out twice across %d concurrent rotations", r.id, n)
+		}
+		seen[r.id] = true
+	}
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily proxy scanner sweep session
+Documentation=https://github.com/venatiodecorus/proxy-scanner
+
+[Timer]
+# 02:00 UTC daily. The explicit UTC suffix means the schedule does not move if
+# the host timezone is ever changed.
+OnCalendar=*-*-* 02:00:00 UTC
+# Run a missed session at boot. Worth having: coverage is the whole point, and a
+# skipped session just delays the sweep. Drop this if you would rather the box
+# never start scanning unattended after an unexpected reboot.
+Persistent=true
+AccuracySec=1min
+Unit=proxy-scanner-scan.service
+
+[Install]
+WantedBy=timers.target

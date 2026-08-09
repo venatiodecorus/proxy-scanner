@@ -65,7 +65,7 @@ docker-compose.yml       — Docker Compose configuration
 ### Scanner (`cmd/scanner`)
 - `SCAN_RATE` — Masscan packets per second (default: `50000`)
 - `SCAN_PORTS` — Comma-separated SOCKS port list (default: `1080,1081,9050`)
-- `SCAN_ADAPTER` — Network interface for masscan (default: `ens3`)
+- `SCAN_ADAPTER` — Network interface for masscan. Unset/empty means masscan auto-detects the default-route interface (no default is baked in)
 - `EXCLUDE_FILE` — Path to CIDR exclusion file (default: `/config/exclude.conf`). Validated at start-up; the scanner refuses to run if the file is missing, short, malformed, or fails a canary check. See "Fail-closed validation" below.
 - `DB_PATH` — Path to SQLite database (default: `/data/proxies.db`)
 - `OUTPUT_FILE` — Path for masscan JSON output (default: `/data/candidates.json`)
@@ -104,6 +104,18 @@ docker-compose.yml       — Docker Compose configuration
 - `API_TOKEN` — Bearer token required for all endpoints except `/v1/health`. Auth is disabled when unset (default: unset/disabled)
 
 The API filters by proxy status. Default is `?status=active` (only proxies that passed their last recheck). Use `?status=stale` to see proxies in the failure-recovery grace period, or `?status=all` to see both. The legacy `?alive=false` parameter is treated as `?status=all`.
+
+### Rotating endpoint (`GET /v1/proxies/rotate`)
+
+Returns one proxy per call, cycling through the whole matching pool before repeating — distinct from `/v1/proxies/random`, which samples with replacement and can repeat immediately.
+
+Rotation state is persisted on the `proxies` table (`last_served_at`, `serve_count`), not held in memory, so it survives restarts and is shared across API replicas. `database.RotateProxy` selects the least-recently-served match and stamps it in a **single `UPDATE ... RETURNING`** statement; keep it that way. Splitting the select and the update reintroduces the race where two concurrent callers get the same proxy.
+
+Ordering is `last_served_at IS NOT NULL, last_served_at ASC, id ASC` — never-served proxies go out first. `idx_proxies_rotation` backs this.
+
+Two deliberate default differences from the other routes, because the endpoint's contract is "a proxy you can use right now": `status` is forced to `active`, and `blocklisted=false` is applied unless the caller passes `blocklisted` explicitly. `limit`/`offset` are ignored. `?format=text` returns a bare `scheme://ip:port` for shell pipelines, and rotating responses set `Cache-Control: no-store`.
+
+Note that `serve_count` is *not* a health signal — the validator and revalidator never touch it.
 
 ## Coding Conventions
 
@@ -163,7 +175,13 @@ Do not weaken either of these, and do not add a flag to bypass them:
 - The scanner and validator can be run independently. The scanner enqueues candidates to SQLite; the validator dequeues and processes them.
 - The revalidator runs by default (no profile required) alongside the API. It rechecks existing SOCKS proxies and mandatory EFnet eligibility on `RECHECK_INTERVAL` (default 1h), immediately stales EFnet-listed proxies, demotes other failing ones to `stale` after `FAILURE_THRESHOLD` consecutive failures, and hard-deletes them after `EVICT_AFTER` without a successful check.
 - When cutting over from the historical mixed-port scanner, back up the database, remove `/data/paused.conf`, clear the old candidates queue, and remove HTTP/HTTPS proxy rows explicitly; this cleanup is intentionally not automatic.
-- For incremental weekly scanning: Set `SCAN_TIMEOUT` (e.g. `4h`) so masscan saves state on timeout. Next run resumes automatically via `/data/paused.conf`.
+- For incremental scanning: Set `SCAN_TIMEOUT` (e.g. `4h`) so masscan saves state on timeout. Next run resumes automatically via `/data/paused.conf`.
+- **Schedule** is systemd timers, defined in `deploy/systemd/` and installed to `/etc/systemd/system/` by `deploy/bootstrap.sh`: `proxy-scanner-scan.timer` daily at 02:00 UTC, `proxy-scanner-validate.timer` daily at 07:00 UTC. The validator also chains off the scanner via `OnSuccess=` so the queue drains as soon as a sweep session ends. Full runbook in `deploy/README.md`.
+- No `flock` is needed under systemd — it refuses to start a second instance of an active unit, so overlapping masscan sessions (which would corrupt `paused.conf` and double the packet rate) cannot happen.
+- `proxy-scanner-scan.service` sets `KillSignal=SIGINT`. Do not change it: masscan only writes `paused.conf` on SIGINT, and a SIGTERM silently discards the session's progress.
+- `SCAN_ADAPTER` unset means "let masscan pick the default-route interface". Do not reintroduce a hardcoded default — the old `ens3` was an OpenStack-ism that breaks on Debian. `buildMasscanArgs` omits the flag entirely when it is empty.
+- A full IPv4 sweep is ~56h of masscan time (3.37B addresses in scope × 3 ports / 50k pps), so daily 4h sessions complete a sweep about every 14 days. Recompute if `SCAN_PORTS`, `SCAN_RATE`, or the exclusion lists change — some older notes in this repo assumed a single port and understated it as ~24h.
+- The validator is a batch job: it drains the candidates queue and exits. It is normally triggered by `OnSuccess=` when a scan session finishes; if you ever drive it on a timer alone, keep that cadence matched to the scanner's or candidates accumulate.
 - All four components share a named Docker volume `scanner-data` mounted at `/data`.
 - SQLite WAL mode allows concurrent reads (API) and writes from validator + revalidator. The single-writer constraint is handled by `_busy_timeout=5000` and per-process connections; transient `SQLITE_BUSY` retries are expected during heavy validator runs.
 - Rate limit masscan to 50k pps to avoid abuse complaints. `docker-compose.yml` must not exceed this; higher rates also cause packet loss on Hetzner Cloud's shared NICs, which silently costs coverage.

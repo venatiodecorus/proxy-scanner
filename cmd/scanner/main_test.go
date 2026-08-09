@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,5 +35,62 @@ func TestScanOutputTotalsMissingFile(t *testing.T) {
 	}
 	if records != 0 || size != 0 {
 		t.Fatalf("expected zero totals, got records=%d size=%d", records, size)
+	}
+}
+
+func TestBuildMasscanArgsOmitsAdapterWhenUnset(t *testing.T) {
+	args := buildMasscanArgs(masscanConfig{
+		ports:       "1080,1081,9050",
+		excludeFile: "/config/exclude.conf",
+		rate:        50000,
+		adapter:     "",
+		outputFile:  "/data/candidates.json",
+	})
+
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--adapter") {
+		t.Fatalf("expected --adapter to be omitted when unset, got: %s", joined)
+	}
+	// Hardcoding an interface name is what broke the move off OpenStack.
+	if strings.Contains(joined, "ens3") {
+		t.Fatalf("no interface name should be baked in, got: %s", joined)
+	}
+}
+
+func TestBuildMasscanArgsIncludesAdapterWhenSet(t *testing.T) {
+	args := buildMasscanArgs(masscanConfig{
+		ports: "1080", excludeFile: "/config/exclude.conf", rate: 1000,
+		adapter: "eth0", outputFile: "/data/candidates.json",
+	})
+
+	found := false
+	for i, a := range args {
+		if a == "--adapter" {
+			if i+1 >= len(args) || args[i+1] != "eth0" {
+				t.Fatalf("--adapter not followed by its value: %v", args)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected --adapter eth0, got: %v", args)
+	}
+}
+
+// The target and the exclusion file are the safety contract: masscan must never
+// be invoked against 0.0.0.0/0 without --excludefile.
+func TestBuildMasscanArgsAlwaysExcludes(t *testing.T) {
+	for _, adapter := range []string{"", "eth0"} {
+		args := buildMasscanArgs(masscanConfig{
+			ports: "1080", excludeFile: "/config/exclude.conf", rate: 1000,
+			adapter: adapter, outputFile: "/data/candidates.json",
+		})
+		if args[0] != "0.0.0.0/0" {
+			t.Errorf("adapter=%q: expected 0.0.0.0/0 as the target, got %q", adapter, args[0])
+		}
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "--excludefile /config/exclude.conf") {
+			t.Errorf("adapter=%q: --excludefile missing from %s", adapter, joined)
+		}
 	}
 }

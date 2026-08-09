@@ -57,6 +57,11 @@ type Proxy struct {
 	CheckCount          int        `json:"check_count"`
 	SuccessCount        int        `json:"success_count"`
 	Status              string     `json:"status"`
+	// LastServedAt and ServeCount are maintained by the rotating endpoint
+	// (GET /v1/proxies/rotate) so it can hand out the least recently served
+	// proxy. They are not touched by the validator or revalidator.
+	LastServedAt *time.Time `json:"last_served_at,omitempty"`
+	ServeCount   int        `json:"serve_count"`
 	// Alive is a legacy field derived from Status == ProxyStatusActive.
 	// Kept for backward compatibility with existing API consumers; new code
 	// should read Status instead.

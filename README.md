@@ -78,17 +78,121 @@ The validator now requires `TEST_URL` to return the observed IPv4 exit address i
 
 ## Incremental Scanning
 
-The scanner supports masscan's `--resume` feature for incremental weekly scanning. When `SCAN_TIMEOUT` is set, the scanner sends SIGINT to masscan after the timeout, causing it to save its state to `/data/paused.conf`. On the next run, the scanner detects this file and resumes from where it left off.
+The scanner supports masscan's `--resume` feature for incremental scanning. When `SCAN_TIMEOUT` is set, the scanner sends SIGINT to masscan after the timeout, causing it to save its state to `/data/paused.conf`. On the next run, the scanner detects this file and resumes from where it left off.
 
 ```bash
 # Set SCAN_TIMEOUT in docker-compose.yml or environment
 SCAN_TIMEOUT=4h
 
-# Run weekly — each session continues where the last one stopped
+# Each session continues where the last one stopped
 docker compose --profile scan up scanner
 ```
 
 Masscan randomizes scan order by default, so resumed scans won't re-scan previously covered segments.
+
+### How long a full sweep takes
+
+| | |
+|---|---|
+| Addresses in scope after exclusions | 3,369,972,995 (78.5% of IPv4) |
+| Ports per address (`SCAN_PORTS`) | 3 |
+| Total probes | 10,109,918,985 |
+| At `SCAN_RATE=50000` | **~56 hours of masscan time** |
+| With `SCAN_TIMEOUT=4h`, sessions per sweep | ~14 |
+
+At the default daily cadence that means a full sweep roughly **every 14 days**. Scale from there: doubling `SCAN_RATE` halves it, and so does dropping to a single port. Recompute this if you change `SCAN_PORTS`, `SCAN_RATE`, or the exclusion lists — the probe count is `addresses_in_scope × ports`, and older docs in this repo assumed a single port.
+
+## Scan Schedule
+
+Scheduling is handled by systemd timers on the host. See [`deploy/README.md`](deploy/README.md) for the full runbook.
+
+| Unit | Schedule | Notes |
+|---|---|---|
+| `proxy-scanner-scan.timer` | Daily, 02:00 UTC | One 4h session (`SCAN_TIMEOUT`), then saves resume state |
+| `proxy-scanner-validate.timer` | Daily, 07:00 UTC | Safety net; normally the validator runs via `OnSuccess=` the moment a scan session ends |
+
+```sh
+systemctl list-timers 'proxy-scanner*'        # what's scheduled
+systemctl start proxy-scanner-scan.service    # run a session now
+systemctl stop proxy-scanner-scan.service     # graceful stop, saves paused.conf
+journalctl -fu proxy-scanner-scan.service     # follow it
+```
+
+To change the cadence, edit `OnCalendar=` in `/etc/systemd/system/proxy-scanner-scan.timer`, then `systemctl daemon-reload && systemctl restart proxy-scanner-scan.timer`.
+
+Two properties worth knowing:
+
+- **Overlap is structurally impossible.** systemd will not start a second instance of an already-active unit. The previous cron setup needed `flock -n` for this, because two concurrent masscan sessions would corrupt the single `paused.conf` *and* double the effective packet rate.
+- **Stopping a scan must send SIGINT.** masscan only writes its resume file on SIGINT; SIGTERM kills it and the session's progress is lost. `proxy-scanner-scan.service` sets `KillSignal=SIGINT` for this reason — prefer `systemctl stop` over `docker kill`.
+
+## Firewalling masscan's Source Ports
+
+masscan brings its own IP stack and sends from `--source-port 40000-56383`. The host kernel knows nothing about those connections, so it answers the returning SYN-ACKs with RSTs — unnecessary traffic to every host you probe, from a port range you are not actually serving. masscan warns about this itself.
+
+Scans work without the rule, so `deploy/install.sh` does not apply it unprompted. Do it before a real sweep.
+
+### Add
+
+The rule goes in its own nftables table. That matters for two reasons: a minimal Debian install may have no `inet filter` table to append to, and a dedicated table can be removed in one command without touching anything else's rules.
+
+```sh
+sudo nft add table inet masscan
+sudo nft add chain inet masscan input '{ type filter hook input priority -10; policy accept; }'
+sudo nft add rule inet masscan input tcp dport 40000-56383 counter drop
+```
+
+Verify — the counter should climb while a scan is running:
+
+```sh
+sudo nft list table inet masscan
+```
+
+Make it survive a reboot by appending the table to `/etc/nftables.conf`:
+
+```sh
+sudo tee -a /etc/nftables.conf >/dev/null <<'EOF'
+
+# Drop kernel responses on masscan's source-port range (see README).
+table inet masscan {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        tcp dport 40000-56383 counter drop
+    }
+}
+EOF
+sudo systemctl enable --now nftables
+sudo nft -c -f /etc/nftables.conf && echo "nftables.conf is valid"
+```
+
+### Remove
+
+```sh
+# Drop it from the running ruleset
+sudo nft delete table inet masscan
+```
+
+Then delete the `table inet masscan { ... }` block from `/etc/nftables.conf` so it does not come back on reboot, and re-validate:
+
+```sh
+sudo nft -c -f /etc/nftables.conf && echo "nftables.conf is valid"
+```
+
+Confirm it is gone (this should report no such table):
+
+```sh
+sudo nft list table inet masscan
+```
+
+### iptables hosts
+
+If the box uses iptables rather than nftables, the add and remove are symmetric — `-I` to insert, `-D` with the identical rule spec to delete:
+
+```sh
+sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP   # add
+sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP   # remove
+```
+
+Persist with `iptables-save > /etc/iptables/rules.v4` (package `iptables-persistent`).
 
 ## Stopping and Resuming
 
@@ -147,11 +251,43 @@ Since the scanner uses `network_mode: host`, all container traffic flows through
 |--------|------|-------------|
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/proxies` | List proxies with filters |
-| `GET` | `/v1/proxies/random` | Random proxy matching filters |
+| `GET` | `/v1/proxies/random` | Random proxy matching filters (samples with replacement) |
+| `GET` | `/v1/proxies/rotate` | **Rotating endpoint** — a different proxy on every call |
 | `GET` | `/v1/proxies/{id}` | Single proxy by ID |
 | `GET` | `/v1/stats` | Aggregate statistics |
 
-### Query Parameters for `/v1/proxies` and `/v1/proxies/random`
+### Rotating Endpoint
+
+`GET /v1/proxies/rotate` is the endpoint to hit when you want a fresh proxy per request rather than a list. Each call returns the **least recently served** proxy matching your filters and stamps it, so successive calls walk the entire matching pool before repeating any entry.
+
+This is the difference from `/v1/proxies/random`, which samples uniformly with replacement and can hand you the same proxy twice in a row.
+
+Two defaults differ from the other routes, because this endpoint's contract is "a proxy you can use right now":
+
+- Only `active` proxies are considered (the `status` parameter is ignored).
+- Blocklisted proxies are excluded unless you pass `blocklisted=true`.
+
+The claim and the serve-stamp happen in a single SQL statement, so concurrent callers never receive the same proxy. Rotation state lives in the `last_served_at` / `serve_count` columns, so it survives API restarts and is shared across replicas.
+
+```bash
+# JSON, with a ready-to-use connection URL alongside the usual proxy fields
+curl "http://localhost:8080/v1/proxies/rotate"
+# => {"id":42,...,"serve_count":7,"url":"socks5://203.0.113.9:1080"}
+
+# Filtered the same way as the list route
+curl "http://localhost:8080/v1/proxies/rotate?protocol=socks5&country=DE&max_latency=500"
+
+# format=text returns a bare proxy URL, for shell pipelines
+curl -s "http://localhost:8080/v1/proxies/rotate?format=text"
+# => socks5://203.0.113.9:1080
+
+# Fetch a page through a freshly rotated proxy
+curl -sx "$(curl -s http://localhost:8080/v1/proxies/rotate?format=text)" https://example.com
+```
+
+Returns `404` when nothing matches the filters.
+
+### Query Parameters for `/v1/proxies`, `/v1/proxies/random` and `/v1/proxies/rotate`
 
 | Parameter | Example | Description |
 |-----------|---------|-------------|
@@ -161,8 +297,12 @@ Since the scanner uses `network_mode: host`, all container traffic flows through
 | `max_latency` | `500` | Maximum latency in ms |
 | `limit` | `50` | Results per page (default 100, max 1000) |
 | `offset` | `100` | Pagination offset |
-| `status` | `active`, `stale`, `all` | Liveness filter (default: `active`). `stale` = recently failing but kept around; `all` = both. |
+| `status` | `active`, `stale`, `all` | Liveness filter (default: `active`). `stale` = recently failing but kept around; `all` = both. Ignored by `/rotate`, which is always `active`. |
 | `alive` | `false` | Legacy alias for `status=all`. |
+| `blocklisted` | `true`, `false` | Filter by blocklist status. `/rotate` defaults to `false`; the other routes do not filter by default. |
+| `format` | `text` | `/rotate` only. Returns a bare `socks5://ip:port` as `text/plain` instead of JSON. |
+
+`limit` and `offset` are ignored by `/rotate` and `/random`, which always return a single proxy.
 
 ### Example Responses
 
@@ -332,9 +472,17 @@ To add a new exclusion (e.g., after an abuse complaint):
 
 1. Add the CIDR to `config/exclude/90-custom.conf`
 2. Commit and push to main
-3. GitHub Actions rebuilds the scanner image
+3. GitHub Actions rebuilds and pushes the scanner image to GHCR
+4. **On the scanner host, pull it:** `sudo /opt/proxy-scanner/update.sh`
 
-Note that exclusions are baked into the image at build time, so an opt-out only takes effect once the rebuilt image rolls out.
+Step 4 is manual and easy to forget. Exclusions are baked into the image at build time, so until the host pulls the new image the old list is still in force and the range keeps being scanned — a pushed commit is not an honoured opt-out. The next scan session after the pull picks it up.
+
+To confirm what the image on the host actually contains:
+
+```sh
+docker run --rm --entrypoint grep \
+  ghcr.io/venatiodecorus/proxy-scanner-scanner:latest -c . /config/exclude.conf
+```
 
 ## Environment Variables
 
@@ -344,12 +492,12 @@ Note that exclusions are baked into the image at build time, so an opt-out only 
 |----------|---------|-------------|
 | `SCAN_RATE` | `50000` | Masscan packets per second |
 | `SCAN_PORTS` | `1080,1081,9050` | SOCKS target ports (comma-separated) |
-| `SCAN_ADAPTER` | `ens3` | Network interface for masscan |
+| `SCAN_ADAPTER` | *(empty)* | Network interface for masscan. Empty means masscan auto-detects the default-route interface |
 | `EXCLUDE_FILE` | `/config/exclude.conf` | CIDR exclusion list |
 | `DB_PATH` | `/data/proxies.db` | SQLite database path |
 | `OUTPUT_FILE` | `/data/candidates.json` | Masscan JSON output (debugging artifact) |
 | `RESUME_FILE` | `/data/paused.conf` | Masscan resume state file |
-| `SCAN_TIMEOUT` | *(none)* | Max scan duration (e.g. `4h`, `30m`). Sends SIGINT to masscan on timeout, enabling incremental weekly scanning |
+| `SCAN_TIMEOUT` | *(none)* | Max scan duration (e.g. `4h`, `30m`). Sends SIGINT to masscan on timeout, enabling incremental scanning across many sessions. Set to `4h` in `docker-compose.yml` |
 
 ### Validator
 
