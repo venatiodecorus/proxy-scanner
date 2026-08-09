@@ -41,27 +41,38 @@ func NewChecker(cfg CheckerConfig) *Checker {
 	return &Checker{cfg: cfg}
 }
 
+// Check validates a candidate as SOCKS5 and SOCKS4 only. HTTP/HTTPS protocol
+// implementations remain available through CheckProtocol for compatibility
+// with historical rows, but new candidate validation is intentionally SOCKS-only.
 func (c *Checker) Check(ctx context.Context, candidate Candidate) []CheckResult {
 	var results []CheckResult
-
-	protocols := []struct {
-		proto Protocol
-		check func(ctx context.Context, candidate Candidate) *CheckResult
-	}{
-		{ProtocolHTTP, c.checkHTTP},
-		{ProtocolHTTPS, c.checkHTTPS},
-		{ProtocolSOCKS5, c.checkSOCKS5},
-		{ProtocolSOCKS4, c.checkSOCKS4},
-	}
-
-	for _, p := range protocols {
-		result := p.check(ctx, candidate)
+	for _, protocol := range []Protocol{ProtocolSOCKS5, ProtocolSOCKS4} {
+		result := c.CheckProtocol(ctx, candidate, protocol)
 		if result != nil && result.Alive {
 			results = append(results, *result)
 		}
 	}
-
 	return results
+}
+
+// CheckProtocol validates a candidate using exactly one protocol.
+func (c *Checker) CheckProtocol(ctx context.Context, candidate Candidate, protocol Protocol) *CheckResult {
+	switch protocol {
+	case ProtocolSOCKS5:
+		return c.checkSOCKS5(ctx, candidate)
+	case ProtocolSOCKS4:
+		return c.checkSOCKS4(ctx, candidate)
+	case ProtocolHTTP:
+		return c.checkHTTP(ctx, candidate)
+	case ProtocolHTTPS:
+		return c.checkHTTPS(ctx, candidate)
+	default:
+		return &CheckResult{
+			Candidate: candidate,
+			Protocol:  protocol,
+			Error:     fmt.Errorf("unsupported proxy protocol %q", protocol),
+		}
+	}
 }
 
 func (c *Checker) checkHTTP(ctx context.Context, candidate Candidate) *CheckResult {
@@ -98,7 +109,7 @@ func (c *Checker) checkHTTPProxy(ctx context.Context, candidate Candidate, proxy
 			Timeout: c.cfg.Timeout,
 		}).DialContext,
 		TLSHandshakeTimeout: c.cfg.Timeout,
-		DisableKeepAlives:    true,
+		DisableKeepAlives:   true,
 	}
 
 	if proto == ProtocolHTTPS {
@@ -230,8 +241,9 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 
 	proxyAddr := fmt.Sprintf("%s:%d", candidate.IP, candidate.Port)
 	targetHost := extractHost(c.cfg.TestURL)
-	if targetHost == "" {
-		result.Error = fmt.Errorf("could not extract host from test URL")
+	requestHost, requestURI, err := httpRequestTarget(c.cfg.TestURL)
+	if targetHost == "" || err != nil {
+		result.Error = fmt.Errorf("parsing test URL: %w", err)
 		return result
 	}
 
@@ -304,7 +316,7 @@ func (c *Checker) checkSOCKS5(ctx context.Context, candidate Candidate) *CheckRe
 		io.ReadFull(conn, discard)
 	}
 
-	httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; proxy-check/1.0)\r\nConnection: close\r\n\r\n", host)
+	httpReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; proxy-check/1.0)\r\nConnection: close\r\n\r\n", requestURI, requestHost)
 	if _, err := conn.Write([]byte(httpReq)); err != nil {
 		result.Error = fmt.Errorf("socks5 http request: %w", err)
 		return result
@@ -344,8 +356,9 @@ func (c *Checker) checkSOCKS4(ctx context.Context, candidate Candidate) *CheckRe
 
 	proxyAddr := fmt.Sprintf("%s:%d", candidate.IP, candidate.Port)
 	targetHost := extractHost(c.cfg.TestURL)
-	if targetHost == "" {
-		result.Error = fmt.Errorf("could not extract host from test URL")
+	requestHost, requestURI, err := httpRequestTarget(c.cfg.TestURL)
+	if targetHost == "" || err != nil {
+		result.Error = fmt.Errorf("parsing test URL: %w", err)
 		return result
 	}
 
@@ -401,7 +414,7 @@ func (c *Checker) checkSOCKS4(ctx context.Context, candidate Candidate) *CheckRe
 		return result
 	}
 
-	httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; proxy-check/1.0)\r\nConnection: close\r\n\r\n", host)
+	httpReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (compatible; proxy-check/1.0)\r\nConnection: close\r\n\r\n", requestURI, requestHost)
 	if _, err := conn.Write([]byte(httpReq)); err != nil {
 		result.Error = fmt.Errorf("socks4 http request: %w", err)
 		return result
@@ -471,6 +484,21 @@ func (c *Checker) detectAnonymity(headers http.Header, body string) Anonymity {
 func extractIP(body string) string {
 	match := ipRegex.FindString(body)
 	return match
+}
+
+func httpRequestTarget(rawURL string) (host, requestURI string, err error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", "", err
+	}
+	if u.Host == "" {
+		return "", "", fmt.Errorf("test URL has no host")
+	}
+	requestURI = u.RequestURI()
+	if requestURI == "" {
+		requestURI = "/"
+	}
+	return u.Host, requestURI, nil
 }
 
 func extractHost(rawURL string) string {

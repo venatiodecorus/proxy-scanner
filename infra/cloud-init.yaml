@@ -20,18 +20,31 @@ write_files:
     permissions: "0644"
     content: |
       # Proxy scanner schedule
-      # Run scanner every Sunday at 02:00 UTC
-      0 2 * * 0 root cd /opt/proxy-scanner && /usr/bin/docker compose --profile scan run --rm scanner >> /var/log/proxy-scanner-scan.log 2>&1
-      # Run validator every Monday at 06:00 UTC
-      0 6 * * 1 root cd /opt/proxy-scanner && /usr/bin/docker compose --profile scan run --rm validator >> /var/log/proxy-scanner-validate.log 2>&1
+      #
+      # A full IPv4 sweep is ~56h of masscan time (3.37B addresses in scope
+      # after exclusions x 3 ports / 50k pps). SCAN_TIMEOUT=4h caps each
+      # session and saves /data/paused.conf, so each run advances the sweep by
+      # 4h and the next run resumes from there. Daily 4h sessions therefore
+      # complete a full sweep roughly every 14 days.
+      #
+      # flock -n is mandatory, not decorative: masscan keeps its resume state in
+      # a single paused.conf, so two concurrent sessions would corrupt it and
+      # double the effective packet rate. -n skips the firing outright if the
+      # previous one is still running rather than queueing behind it.
+      SHELL=/bin/bash
+      # Scanner: daily at 02:00 UTC (runs until ~06:00 UTC)
+      0 2 * * * root /usr/bin/flock -n /var/lock/proxy-scanner-scan.lock -c 'cd /opt/proxy-scanner && /usr/bin/docker compose --profile scan run --rm scanner' >> /var/log/proxy-scanner-scan.log 2>&1
+      # Validator: daily at 07:00 UTC, an hour after the scan window closes, so
+      # it drains the candidates queue on the same cadence the scanner fills it.
+      0 7 * * * root /usr/bin/flock -n /var/lock/proxy-scanner-validate.lock -c 'cd /opt/proxy-scanner && /usr/bin/docker compose --profile scan run --rm validator' >> /var/log/proxy-scanner-validate.log 2>&1
 
   - path: /etc/logrotate.d/proxy-scanner
     owner: root:root
     permissions: "0644"
     content: |
       /var/log/proxy-scanner-*.log {
-        weekly
-        rotate 4
+        daily
+        rotate 14
         compress
         missingok
         notifempty

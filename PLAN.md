@@ -1,8 +1,24 @@
 # Proxy Scanner — Implementation Plan
 
+> **Historical document — superseded in the deployment sections.**
+>
+> This records the original plan and the phase-by-phase build-out. The
+> application design (scanner → candidate queue → validator → SQLite → API,
+> plus the revalidator) still matches reality, but **the deployment story
+> below does not.**
+>
+> There is no Kubernetes, no k3s cluster, no FluxCD, and no PVC. The system runs
+> as Docker containers on a single Debian host, scheduled by systemd timers.
+> References to CronJobs, PVCs, GitOps reconciliation and a `deploy/` directory
+> of Kubernetes manifests are all obsolete — note that `deploy/` now holds the
+> systemd units and host install scripts instead.
+>
+> For how this is actually deployed and operated, read
+> [`deploy/README.md`](deploy/README.md) and the README.
+
 ## Overview
 
-A Kubernetes-native system that scans the public IPv4 space for open proxies (HTTP/HTTPS/SOCKS4/SOCKS5), validates them, tests speed, and exposes verified proxies via a REST API. Deployed via GitOps (FluxCD) on a Hetzner Cloud k3s cluster.
+A system that scans the public IPv4 space for open SOCKS4/SOCKS5 proxies, validates them behind a mandatory EFnet RBL eligibility gate, tests speed, and exposes verified proxies via a REST API.
 
 ## Architecture
 
@@ -18,8 +34,8 @@ A Kubernetes-native system that scans the public IPv4 space for open proxies (HT
 │         ▼                                               │
 │  ┌──────────────┐    Job (triggered after scan)         │
 │  │  validate-job│──→ Go binary: connects through each   │
-│  │  (Go)        │    proxy, tests HTTP/SOCKS, measures  │
-│  │              │    latency, checks anonymity level     │
+│  │  (Go)        │    SOCKS proxy, enforces EFnet RBL,   │
+│  │              │    measures latency and anonymity      │
 │  └──────┬───────┘                                       │
 │         │ writes verified proxies to SQLite              │
 │         ▼                                               │
@@ -42,14 +58,16 @@ A Kubernetes-native system that scans the public IPv4 space for open proxies (HT
 
 ### 1. Scanner (masscan CronJob)
 - Alpine-based container with masscan
-- Scans `0.0.0.0/0` minus excluded ranges at 50k pps (~24h full sweep)
-- Targets ports: 3128, 8080, 1080, 8888, 9050, 8443, 3129, 80, 443, 1081
+- Scans `0.0.0.0/0` minus excluded ranges at 50k pps (~56h full sweep across 3 ports; see README "How long a full sweep takes")
+- Targets SOCKS ports: 1080, 1081, 9050
 - Outputs JSON to shared PVC
 - Triggers validator job on completion
 
 ### 2. Validator (Go Job)
 - Reads masscan JSON output
-- Tests each candidate as HTTP, HTTPS, SOCKS4, SOCKS5 proxy
+- Tests each candidate as a SOCKS4 or SOCKS5 proxy
+- Enforces mandatory `rbl.efnetrbl.org` eligibility checks for both endpoint and observed exit IP; listed candidates are rejected and indeterminate lookups are deferred rather than accepted
+- Optional auxiliary DNSBLs may be skipped with `SKIP_AUX_BLOCKLISTS`, but the EFnet gate cannot be disabled
 - Measures latency, checks anonymity level (transparent/anonymous/elite)
 - GeoIP tagging via bundled MaxMind GeoLite2-City + ASN databases
 - ASN (Autonomous System Number) enrichment for network-level metadata
@@ -166,14 +184,14 @@ Published to GHCR:
 
 ## Key Design Decisions
 
-1. **50k pps scan rate** — Conservative for Hetzner Cloud shared NICs. Full IPv4 sweep in ~24h, fits weekly cadence.
+1. **50k pps scan rate** — Conservative for Hetzner Cloud shared NICs. A full IPv4 sweep is ~56h of masscan time across the 3 SOCKS ports (the original ~24h figure assumed a single port), so with `SCAN_TIMEOUT=4h` and the daily cron a sweep completes about every 14 days.
 2. **SQLite over PostgreSQL** — Write-once-read-many workload. Single writer (validator), single reader (API). WAL mode enables concurrent access. Dataset (50k-200k proxies) fits trivially.
 3. **Separate scan/validate phases** — Masscan excels at raw port discovery. Go excels at concurrent proxy negotiation. Each can be debugged independently.
 4. **CronJob + Job over Deployment** — Batch workloads with clear start/end. No wasted resources between runs.
 5. **Go over Python/nmap** — Goroutine pool handles thousands of concurrent proxy tests. Nmap NSE scripts are slow and hard to parallelize.
 6. **GeoIP via MaxMind GeoLite2-City + ASN** — Tags proxies with country/city/ASN for filtering. Databases bundled in validator image (~80MB total).
 7. **Egress IP auto-detection** — Validator auto-detects its public IP at startup for anonymity classification. Zero-config by default; overridable via `ORIGIN_IP` env var.
-8. **GitHub Actions CI/CD** — PR checks run tests/vet. Pushes to main build and push all 3 images to GHCR with `sha-*` and `latest` tags.
+8. **GitHub Actions CI/CD** — PR checks run tests/vet. Pushes to main build and push all 4 images to GHCR with `sha-*` and `latest` tags.
 
 ---
 
@@ -238,7 +256,7 @@ Published to GHCR:
 - [x] Egress IP auto-detection at validator startup (queries ipify/ifconfig.me/icanhazip/checkip.amazonaws.com)
 - [x] `ORIGIN_IP` env var override preserved for manual configuration
 - [x] GitHub Actions CI workflow (`.github/workflows/ci.yaml`) — tests + vet on PRs
-- [x] GitHub Actions build+push workflow (`.github/workflows/build-push.yaml`) — builds all 3 images to GHCR on push to main
+- [x] GitHub Actions build+push workflow (`.github/workflows/build-push.yaml`) — builds all 4 images to GHCR on push to main
 - [x] ConfigMap updated: removed `GEOIP_DB` (bundled), `ORIGIN_IP` (auto-detected)
 - [x] PLAN.md and AGENTS.md updated
 
@@ -251,4 +269,7 @@ Published to GHCR:
 - [x] `90-custom.conf` — Empty template with instructions for adding abuse-complaint exclusions
 - [x] Dockerfile.scanner updated: merges all `config/exclude/*.conf` at build time into a single clean CIDR file
 - [x] 88 unique exclusion entries across all categories, zero duplicates
-- [x] Adding exclusions is pure GitOps: edit file, commit, push, image rebuilds, FluxCD deploys
+      *(superseded: the generated `*-asn.conf` lists brought this to ~7,600 entries)*
+- [x] Adding exclusions: edit file, commit, push, image rebuilds
+      *(superseded: the rollout is not automatic — the host must pull the new
+      image with `update.sh` before the exclusion takes effect)*

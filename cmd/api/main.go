@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -52,6 +54,7 @@ func run(logger *slog.Logger) error {
 	mux.HandleFunc("GET /v1/health", api.handleHealth)
 	mux.HandleFunc("GET /v1/proxies", api.handleListProxies)
 	mux.HandleFunc("GET /v1/proxies/random", api.handleRandomProxy)
+	mux.HandleFunc("GET /v1/proxies/rotate", api.handleRotateProxy)
 	mux.HandleFunc("GET /v1/proxies/{id}", api.handleGetProxy)
 	mux.HandleFunc("GET /v1/stats", api.handleStats)
 
@@ -124,7 +127,7 @@ func (a *apiServer) handleListProxies(w http.ResponseWriter, r *http.Request) {
 // handleRandomProxy returns a single random proxy matching the filter.
 func (a *apiServer) handleRandomProxy(w http.ResponseWriter, r *http.Request) {
 	filter := parseFilter(r)
-	filter.AliveOnly = true // random should always return alive proxies
+	filter.Status = proxy.ProxyStatusActive // random must always return active proxies
 	p, err := a.db.RandomProxy(filter)
 	if err != nil {
 		a.logger.Error("getting random proxy", "error", err)
@@ -136,6 +139,80 @@ func (a *apiServer) handleRandomProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
+}
+
+// handleRotateProxy is the rotating endpoint: every call returns a different
+// proxy, cycling through the whole matching pool before repeating. This is the
+// endpoint to hit in a loop when you want a fresh proxy per request; use
+// /v1/proxies for a list and /v1/proxies/random for an unweighted sample.
+//
+// The response is the same proxy object the other routes return, plus a `url`
+// field ready to hand to a client. Add ?format=text to get bare
+// `socks5://ip:port` as text/plain instead, which is convenient in shell
+// pipelines:
+//
+//	curl -sx "$(curl -s $API/v1/proxies/rotate?format=text)" https://example.com
+//
+// Filters are the same optional query parameters the list route accepts —
+// protocol, country, anonymity, max_latency. Two defaults differ from the other
+// routes, because this endpoint's contract is "a proxy you can use right now":
+// only active proxies are considered, and blocklisted ones are excluded unless
+// you explicitly ask for them with ?blocklisted=true.
+func (a *apiServer) handleRotateProxy(w http.ResponseWriter, r *http.Request) {
+	filter := parseFilter(r)
+	filter.Status = proxy.ProxyStatusActive
+	if filter.Blocklisted == nil {
+		notBlocklisted := false
+		filter.Blocklisted = &notBlocklisted
+	}
+	// Rotation returns exactly one proxy; the list route's limit/offset are
+	// meaningless here and would only confuse the query.
+	filter.Limit = 0
+	filter.Offset = 0
+
+	p, err := a.db.RotateProxy(filter)
+	if err != nil {
+		a.logger.Error("rotating proxy", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	if p == nil {
+		if r.URL.Query().Get("format") == "text" {
+			http.Error(w, "no proxies match the given filters", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no proxies match the given filters"})
+		return
+	}
+
+	if r.URL.Query().Get("format") == "text" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, proxyURL(p)+"\n")
+		return
+	}
+
+	// Rotating responses must never be cached, or a caching client would defeat
+	// the whole point of the endpoint.
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, rotateResponse{Proxy: p, URL: proxyURL(p)})
+}
+
+// rotateResponse embeds the proxy so the JSON shape stays a superset of what the
+// other proxy routes return, with the ready-to-use URL added alongside.
+type rotateResponse struct {
+	*proxy.Proxy
+	URL string `json:"url"`
+}
+
+// proxyURL renders a proxy as a connection URL, e.g. socks5://1.2.3.4:1080.
+func proxyURL(p *proxy.Proxy) string {
+	scheme := string(p.Protocol)
+	if scheme == "" {
+		scheme = string(proxy.ProtocolSOCKS5)
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, p.IP, p.Port)
 }
 
 // handleGetProxy returns a single proxy by ID.
@@ -167,10 +244,24 @@ func (a *apiServer) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseFilter extracts ProxyFilter from query parameters.
+//
+// Default is to return only active proxies. Override with:
+//   - ?status=active  — only active (default)
+//   - ?status=stale   — only stale (failing recently but kept around)
+//   - ?status=all     — both
+//   - ?alive=false    — legacy alias for ?status=all
 func parseFilter(r *http.Request) proxy.ProxyFilter {
 	q := r.URL.Query()
 	f := proxy.ProxyFilter{
-		AliveOnly: true, // default to alive only
+		Status: proxy.ProxyStatusActive, // default to active only
+	}
+
+	if v := q.Get("status"); v != "" {
+		s := strings.ToLower(v)
+		switch s {
+		case proxy.ProxyStatusActive, proxy.ProxyStatusStale, "all":
+			f.Status = s
+		}
 	}
 
 	if v := q.Get("protocol"); v != "" {
@@ -200,8 +291,10 @@ func parseFilter(r *http.Request) proxy.ProxyFilter {
 			f.Offset = n
 		}
 	}
+	// Legacy: ?alive=false maps to status=all so callers that previously
+	// asked for "everything including dead" still work.
 	if v := q.Get("alive"); v == "false" || v == "0" {
-		f.AliveOnly = false
+		f.Status = "all"
 	}
 	if v := q.Get("blocklisted"); v != "" {
 		b, err := strconv.ParseBool(v)

@@ -94,14 +94,31 @@ func TestUpsertAndGetProxy(t *testing.T) {
 func TestListProxiesFilters(t *testing.T) {
 	db := mustOpen(t)
 
+	// All three start active. The third gets pushed to stale via three
+	// recorded failures so we can verify the AliveOnly/Status filters.
 	proxies := []*proxy.Proxy{
 		{IP: "1.1.1.1", Port: 8080, Protocol: proxy.ProtocolHTTP, Anonymity: proxy.AnonymityElite, Country: "US", LatencyMs: 100, Alive: true},
 		{IP: "2.2.2.2", Port: 1080, Protocol: proxy.ProtocolSOCKS5, Anonymity: proxy.AnonymityAnonymous, Country: "DE", LatencyMs: 200, Alive: true},
-		{IP: "3.3.3.3", Port: 3128, Protocol: proxy.ProtocolHTTP, Anonymity: proxy.AnonymityTransparent, Country: "US", LatencyMs: 500, Alive: false},
+		{IP: "3.3.3.3", Port: 3128, Protocol: proxy.ProtocolHTTP, Anonymity: proxy.AnonymityTransparent, Country: "US", LatencyMs: 500, Alive: true},
 	}
 	for _, p := range proxies {
 		if err := db.UpsertProxy(p); err != nil {
 			t.Fatalf("upserting: %v", err)
+		}
+	}
+	all, err := db.ListProxies(proxy.ProxyFilter{Status: "all"})
+	if err != nil {
+		t.Fatalf("listing: %v", err)
+	}
+	var staleID int64
+	for _, p := range all {
+		if p.IP == "3.3.3.3" {
+			staleID = p.ID
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := db.RecordCheckFailure(staleID, 3); err != nil {
+			t.Fatalf("recording failure: %v", err)
 		}
 	}
 
@@ -110,14 +127,16 @@ func TestListProxiesFilters(t *testing.T) {
 		filter proxy.ProxyFilter
 		want   int
 	}{
-		{"all", proxy.ProxyFilter{}, 3},
+		{"all", proxy.ProxyFilter{Status: "all"}, 3},
 		{"alive only", proxy.ProxyFilter{AliveOnly: true}, 2},
-		{"http", proxy.ProxyFilter{Protocol: proxy.ProtocolHTTP}, 2},
-		{"socks5", proxy.ProxyFilter{Protocol: proxy.ProtocolSOCKS5}, 1},
-		{"US", proxy.ProxyFilter{Country: "US"}, 2},
-		{"elite", proxy.ProxyFilter{Anonymity: proxy.AnonymityElite}, 1},
-		{"max latency 150", proxy.ProxyFilter{MaxLatency: 150}, 1},
-		{"limit 1", proxy.ProxyFilter{Limit: 1}, 1},
+		{"status active", proxy.ProxyFilter{Status: proxy.ProxyStatusActive}, 2},
+		{"status stale", proxy.ProxyFilter{Status: proxy.ProxyStatusStale}, 1},
+		{"http", proxy.ProxyFilter{Status: "all", Protocol: proxy.ProtocolHTTP}, 2},
+		{"socks5", proxy.ProxyFilter{Status: "all", Protocol: proxy.ProtocolSOCKS5}, 1},
+		{"US", proxy.ProxyFilter{Status: "all", Country: "US"}, 2},
+		{"elite", proxy.ProxyFilter{Status: "all", Anonymity: proxy.AnonymityElite}, 1},
+		{"max latency 150", proxy.ProxyFilter{Status: "all", MaxLatency: 150}, 1},
+		{"limit 1", proxy.ProxyFilter{Status: "all", Limit: 1}, 1},
 		{"alive US http", proxy.ProxyFilter{AliveOnly: true, Protocol: proxy.ProtocolHTTP, Country: "US"}, 1},
 	}
 
@@ -242,13 +261,25 @@ func TestScanRuns(t *testing.T) {
 func TestStats(t *testing.T) {
 	db := mustOpen(t)
 
+	// Three active proxies; the third is then pushed to stale via failures
+	// so the active counts collapse to 2.
 	proxies := []*proxy.Proxy{
 		{IP: "1.1.1.1", Port: 8080, Protocol: proxy.ProtocolHTTP, Anonymity: proxy.AnonymityElite, Country: "US", LatencyMs: 100, Alive: true},
 		{IP: "2.2.2.2", Port: 1080, Protocol: proxy.ProtocolSOCKS5, Anonymity: proxy.AnonymityAnonymous, Country: "DE", LatencyMs: 200, Alive: true},
-		{IP: "3.3.3.3", Port: 3128, Protocol: proxy.ProtocolHTTP, Anonymity: proxy.AnonymityTransparent, Country: "US", LatencyMs: 500, Alive: false},
+		{IP: "3.3.3.3", Port: 3128, Protocol: proxy.ProtocolHTTP, Anonymity: proxy.AnonymityTransparent, Country: "US", LatencyMs: 500, Alive: true},
 	}
 	for _, p := range proxies {
 		db.UpsertProxy(p)
+	}
+	all, _ := db.ListProxies(proxy.ProxyFilter{Status: "all"})
+	for _, p := range all {
+		if p.IP == "3.3.3.3" {
+			for i := 0; i < 3; i++ {
+				if err := db.RecordCheckFailure(p.ID, 3); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
 	}
 
 	stats, err := db.Stats()
@@ -258,17 +289,23 @@ func TestStats(t *testing.T) {
 	if stats.TotalProxies != 3 {
 		t.Errorf("expected 3 total, got %d", stats.TotalProxies)
 	}
+	if stats.ActiveProxies != 2 {
+		t.Errorf("expected 2 active, got %d", stats.ActiveProxies)
+	}
 	if stats.AliveProxies != 2 {
-		t.Errorf("expected 2 alive, got %d", stats.AliveProxies)
+		t.Errorf("expected 2 alive (legacy alias), got %d", stats.AliveProxies)
+	}
+	if stats.StaleProxies != 1 {
+		t.Errorf("expected 1 stale, got %d", stats.StaleProxies)
 	}
 	if stats.ByProtocol["http"] != 1 {
-		t.Errorf("expected 1 alive http, got %d", stats.ByProtocol["http"])
+		t.Errorf("expected 1 active http, got %d", stats.ByProtocol["http"])
 	}
 	if stats.ByProtocol["socks5"] != 1 {
-		t.Errorf("expected 1 alive socks5, got %d", stats.ByProtocol["socks5"])
+		t.Errorf("expected 1 active socks5, got %d", stats.ByProtocol["socks5"])
 	}
 	if stats.ByCountry["US"] != 1 {
-		t.Errorf("expected 1 alive US, got %d", stats.ByCountry["US"])
+		t.Errorf("expected 1 active US, got %d", stats.ByCountry["US"])
 	}
 	if stats.AvgLatencyMs != 150 {
 		t.Errorf("expected avg latency 150, got %d", stats.AvgLatencyMs)
@@ -490,6 +527,384 @@ func TestResetProcessingCandidates(t *testing.T) {
 	}
 }
 
+func TestUpsertProxySetsLivenessFields(t *testing.T) {
+	db := mustOpen(t)
+
+	p := &proxy.Proxy{
+		IP: "1.2.3.4", Port: 8080, Protocol: proxy.ProtocolHTTP,
+		LatencyMs: 100, Alive: true,
+	}
+	if err := db.UpsertProxy(p); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, err := db.ListProxies(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 proxy, got %d", len(got))
+	}
+	row := got[0]
+
+	if row.Status != proxy.ProxyStatusActive {
+		t.Errorf("expected status active, got %q", row.Status)
+	}
+	if row.CheckCount != 1 {
+		t.Errorf("expected check_count=1, got %d", row.CheckCount)
+	}
+	if row.SuccessCount != 1 {
+		t.Errorf("expected success_count=1, got %d", row.SuccessCount)
+	}
+	if row.ConsecutiveFailures != 0 {
+		t.Errorf("expected consecutive_failures=0, got %d", row.ConsecutiveFailures)
+	}
+	if row.LastCheckedAt == nil {
+		t.Error("expected last_checked_at to be set")
+	}
+	if row.LastOkAt == nil {
+		t.Error("expected last_ok_at to be set")
+	}
+
+	// Re-upsert: counters should increment, consecutive_failures stays 0.
+	if err := db.UpsertProxy(p); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{})
+	row = got[0]
+	if row.CheckCount != 2 {
+		t.Errorf("expected check_count=2 after re-upsert, got %d", row.CheckCount)
+	}
+	if row.SuccessCount != 2 {
+		t.Errorf("expected success_count=2 after re-upsert, got %d", row.SuccessCount)
+	}
+}
+
+func TestRecordCheckSuccessRecoversStaleProxy(t *testing.T) {
+	db := mustOpen(t)
+
+	p := &proxy.Proxy{IP: "1.1.1.1", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}
+	if err := db.UpsertProxy(p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	id := got[0].ID
+
+	// Push it to stale.
+	for i := 0; i < 3; i++ {
+		if err := db.RecordCheckFailure(id, 3); err != nil {
+			t.Fatalf("recording failure: %v", err)
+		}
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{})
+	if got[0].Status != proxy.ProxyStatusStale {
+		t.Fatalf("expected status stale after 3 failures, got %q", got[0].Status)
+	}
+	if got[0].Alive {
+		t.Error("expected alive=false after going stale")
+	}
+
+	// Successful recheck should restore it.
+	err := db.RecordCheckSuccess(id, CheckSuccessUpdate{
+		LatencyMs: 200,
+		Anonymity: proxy.AnonymityElite,
+		ExitIP:    "9.9.9.9",
+	})
+	if err != nil {
+		t.Fatalf("recording success: %v", err)
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{})
+	row := got[0]
+	if row.Status != proxy.ProxyStatusActive {
+		t.Errorf("expected status active after recovery, got %q", row.Status)
+	}
+	if !row.Alive {
+		t.Error("expected alive=true after recovery")
+	}
+	if row.ConsecutiveFailures != 0 {
+		t.Errorf("expected consecutive_failures=0 after recovery, got %d", row.ConsecutiveFailures)
+	}
+	if row.LatencyMs != 200 {
+		t.Errorf("expected latency 200, got %d", row.LatencyMs)
+	}
+	if row.ExitIP != "9.9.9.9" {
+		t.Errorf("expected exit_ip 9.9.9.9, got %s", row.ExitIP)
+	}
+	if row.SuccessCount != 2 {
+		t.Errorf("expected success_count=2, got %d", row.SuccessCount)
+	}
+	if row.CheckCount != 5 { // 1 upsert + 3 fails + 1 success
+		t.Errorf("expected check_count=5, got %d", row.CheckCount)
+	}
+}
+
+func TestRecordCheckFailureBelowThreshold(t *testing.T) {
+	db := mustOpen(t)
+
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "1.1.1.1", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	id := got[0].ID
+
+	// Two failures shouldn't flip status when threshold is 3.
+	for i := 0; i < 2; i++ {
+		if err := db.RecordCheckFailure(id, 3); err != nil {
+			t.Fatalf("recording failure: %v", err)
+		}
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{})
+	row := got[0]
+	if row.Status != proxy.ProxyStatusActive {
+		t.Errorf("expected status to remain active below threshold, got %q", row.Status)
+	}
+	if !row.Alive {
+		t.Error("expected alive=true to remain below threshold")
+	}
+	if row.ConsecutiveFailures != 2 {
+		t.Errorf("expected consecutive_failures=2, got %d", row.ConsecutiveFailures)
+	}
+}
+
+func TestRecordEligibilityFailureImmediatelyStalesProxy(t *testing.T) {
+	db := mustOpen(t)
+
+	p := &proxy.Proxy{IP: "1.1.1.1", Port: 1080, Protocol: proxy.ProtocolSOCKS5, Alive: true}
+	if err := db.UpsertProxy(p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	id := got[0].ID
+	lastOK := got[0].LastOkAt
+
+	if err := db.RecordEligibilityFailure(id, true, "rbl.efnetrbl.org"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{Status: "all"})
+	row := got[0]
+	if row.Status != proxy.ProxyStatusStale || row.Alive {
+		t.Fatalf("expected stale/inactive proxy, got status=%q alive=%v", row.Status, row.Alive)
+	}
+	if !row.Blocklisted || row.Blocklists != "rbl.efnetrbl.org" {
+		t.Fatalf("expected EFnet blocklist metadata, got blocklisted=%v blocklists=%q", row.Blocklisted, row.Blocklists)
+	}
+	if row.CheckCount != 2 || row.ConsecutiveFailures != 1 {
+		t.Fatalf("unexpected counters: check_count=%d consecutive_failures=%d", row.CheckCount, row.ConsecutiveFailures)
+	}
+	if lastOK == nil || row.LastOkAt == nil || !row.LastOkAt.Equal(*lastOK) {
+		t.Fatal("eligibility failure must preserve last_ok_at")
+	}
+}
+
+func TestRecordCheckSuccessPreservesBlocklistByDefault(t *testing.T) {
+	db := mustOpen(t)
+
+	p := &proxy.Proxy{
+		IP: "1.1.1.1", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true,
+		Blocklisted: true, Blocklists: "spamhaus",
+	}
+	if err := db.UpsertProxy(p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	id := got[0].ID
+
+	// Recheck without setting blocklist — existing values should remain.
+	if err := db.RecordCheckSuccess(id, CheckSuccessUpdate{LatencyMs: 50}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{})
+	row := got[0]
+	if !row.Blocklisted {
+		t.Error("expected blocklisted to be preserved")
+	}
+	if row.Blocklists != "spamhaus" {
+		t.Errorf("expected blocklists=spamhaus, got %q", row.Blocklists)
+	}
+
+	// Now explicitly clear it via SetBlocklist.
+	if err := db.RecordCheckSuccess(id, CheckSuccessUpdate{
+		LatencyMs:    50,
+		SetBlocklist: true,
+		Blocklisted:  false,
+		Blocklists:   "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.ListProxies(proxy.ProxyFilter{})
+	row = got[0]
+	if row.Blocklisted {
+		t.Error("expected blocklisted to be cleared")
+	}
+	if row.Blocklists != "" {
+		t.Errorf("expected empty blocklists, got %q", row.Blocklists)
+	}
+}
+
+func TestListProxiesForRecheck(t *testing.T) {
+	db := mustOpen(t)
+
+	// Three SOCKS proxies plus one legacy HTTP row that must not be rechecked.
+	for _, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"} {
+		if err := db.UpsertProxy(&proxy.Proxy{IP: ip, Port: 1080, Protocol: proxy.ProtocolSOCKS5, Alive: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "4.4.4.4", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE proxies SET last_checked_at = ? WHERE ip = '4.4.4.4'", time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// SOCKS rows were just upserted, so last_checked_at is ~now. The old HTTP
+	// row is excluded from the SOCKS-only recheck set.
+	// none should be eligible.
+	due, err := db.ListProxiesForRecheck(10, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Errorf("expected 0 due, got %d", len(due))
+	}
+
+	// Backdate one row directly so we have a deterministic candidate.
+	if _, err := db.db.Exec("UPDATE proxies SET last_checked_at = ? WHERE ip = '1.1.1.1'", time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	due, err = db.ListProxiesForRecheck(10, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due, got %d", len(due))
+	}
+	if due[0].IP != "1.1.1.1" {
+		t.Errorf("expected 1.1.1.1, got %s", due[0].IP)
+	}
+
+	// Limit honored.
+	if _, err := db.db.Exec("UPDATE proxies SET last_checked_at = ? WHERE ip IN ('2.2.2.2','3.3.3.3')", time.Now().UTC().Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	due, _ = db.ListProxiesForRecheck(2, time.Hour)
+	if len(due) != 2 {
+		t.Errorf("expected limit 2, got %d", len(due))
+	}
+	// Oldest first: 2.2.2.2/3.3.3.3 are older than 1.1.1.1.
+	if due[0].LastCheckedAt == nil || due[1].LastCheckedAt == nil {
+		t.Fatal("expected last_checked_at populated")
+	}
+	if !due[0].LastCheckedAt.Before(*due[1].LastCheckedAt) && !due[0].LastCheckedAt.Equal(*due[1].LastCheckedAt) {
+		t.Error("expected oldest last_checked_at first")
+	}
+}
+
+func TestListProxiesForRecheckNullCheckedFirst(t *testing.T) {
+	db := mustOpen(t)
+
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "1.1.1.1", Port: 1080, Protocol: proxy.ProtocolSOCKS5, Alive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "2.2.2.2", Port: 1080, Protocol: proxy.ProtocolSOCKS4, Alive: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Wipe last_checked_at on one row to simulate a row from before liveness tracking.
+	if _, err := db.db.Exec("UPDATE proxies SET last_checked_at = NULL WHERE ip = '2.2.2.2'"); err != nil {
+		t.Fatal(err)
+	}
+
+	due, err := db.ListProxiesForRecheck(10, time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 2 {
+		t.Fatalf("expected 2 due, got %d", len(due))
+	}
+	// NULL last_checked_at must come first.
+	if due[0].IP != "2.2.2.2" {
+		t.Errorf("expected NULL last_checked_at row first, got %s", due[0].IP)
+	}
+}
+
+func TestEvictDeadProxies(t *testing.T) {
+	db := mustOpen(t)
+
+	for _, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"} {
+		if err := db.UpsertProxy(&proxy.Proxy{IP: ip, Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1.1.1.1 fails 3 times AND its last_ok_at is well in the past -> evict.
+	if _, err := db.db.Exec("UPDATE proxies SET consecutive_failures = 3, last_ok_at = ? WHERE ip = '1.1.1.1'", time.Now().UTC().Add(-200*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// 2.2.2.2 fails 3 times but recent last_ok_at -> keep.
+	if _, err := db.db.Exec("UPDATE proxies SET consecutive_failures = 3, last_ok_at = ? WHERE ip = '2.2.2.2'", time.Now().UTC().Add(-1*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// 3.3.3.3: only 1 failure but old last_ok_at -> keep (under threshold).
+	if _, err := db.db.Exec("UPDATE proxies SET consecutive_failures = 1, last_ok_at = ? WHERE ip = '3.3.3.3'", time.Now().UTC().Add(-200*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := db.EvictDeadProxies(3, 168*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Errorf("expected 1 evicted, got %d", deleted)
+	}
+
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	if len(got) != 2 {
+		t.Errorf("expected 2 remaining, got %d", len(got))
+	}
+	for _, p := range got {
+		if p.IP == "1.1.1.1" {
+			t.Error("1.1.1.1 should have been evicted")
+		}
+	}
+}
+
+func TestMigrateBackfillsLegacyRows(t *testing.T) {
+	db := mustOpen(t)
+
+	// Insert a row via UpsertProxy (so it's correctly populated), then wipe the
+	// liveness fields to simulate a row that predates liveness tracking.
+	if err := db.UpsertProxy(&proxy.Proxy{IP: "1.2.3.4", Port: 8080, Protocol: proxy.ProtocolHTTP, Alive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`UPDATE proxies SET last_checked_at = NULL, last_ok_at = NULL, status = '', check_count = 0, success_count = 0`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrate(); err != nil {
+		t.Fatalf("re-migrate: %v", err)
+	}
+
+	got, _ := db.ListProxies(proxy.ProxyFilter{})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 proxy, got %d", len(got))
+	}
+	row := got[0]
+	if row.LastCheckedAt == nil {
+		t.Error("expected last_checked_at backfilled")
+	}
+	if row.LastOkAt == nil {
+		t.Error("expected last_ok_at backfilled")
+	}
+	if row.Status != proxy.ProxyStatusActive {
+		t.Errorf("expected backfilled status active for alive row, got %q", row.Status)
+	}
+	if row.CheckCount != 1 {
+		t.Errorf("expected check_count backfilled to 1, got %d", row.CheckCount)
+	}
+	if row.SuccessCount != 1 {
+		t.Errorf("expected success_count backfilled to 1, got %d", row.SuccessCount)
+	}
+}
+
 func TestCandidateQueueEndToEnd(t *testing.T) {
 	db := mustOpen(t)
 
@@ -532,5 +947,252 @@ func TestCandidateQueueEndToEnd(t *testing.T) {
 	}
 	if enqueued != 3 {
 		t.Errorf("expected 3 re-enqueued after deletion, got %d", enqueued)
+	}
+}
+
+// seedProxies inserts n SOCKS5 proxies on sequential ports and returns them.
+func seedProxies(t *testing.T, db *DB, n int) []proxy.Proxy {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		p := &proxy.Proxy{
+			IP:        "10.0.0.1",
+			Port:      1080 + i,
+			Protocol:  proxy.ProtocolSOCKS5,
+			Country:   "US",
+			LatencyMs: 100 + i,
+			Alive:     true,
+		}
+		if err := db.UpsertProxy(p); err != nil {
+			t.Fatalf("upserting proxy %d: %v", i, err)
+		}
+	}
+	proxies, err := db.ListProxies(proxy.ProxyFilter{Status: "all"})
+	if err != nil {
+		t.Fatalf("listing seeded proxies: %v", err)
+	}
+	if len(proxies) != n {
+		t.Fatalf("expected %d seeded proxies, got %d", n, len(proxies))
+	}
+	return proxies
+}
+
+// TestRotateProxyCyclesWholePool is the core contract: successive calls must walk
+// every proxy in the pool before repeating any of them.
+func TestRotateProxyCyclesWholePool(t *testing.T) {
+	db := mustOpen(t)
+	const n = 5
+	seedProxies(t, db, n)
+
+	seen := map[int64]int{}
+	for i := 0; i < n; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{})
+		if err != nil {
+			t.Fatalf("rotate %d: %v", i, err)
+		}
+		if p == nil {
+			t.Fatalf("rotate %d returned nil with %d proxies available", i, n)
+		}
+		seen[p.ID]++
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct proxies over %d calls, got %d (%v)", n, n, len(seen), seen)
+	}
+
+	// The next full cycle must cover the pool again, in the same order.
+	for i := 0; i < n; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{})
+		if err != nil {
+			t.Fatalf("second cycle rotate %d: %v", i, err)
+		}
+		seen[p.ID]++
+	}
+	for id, count := range seen {
+		if count != 2 {
+			t.Errorf("proxy %d served %d times over two full cycles, want 2", id, count)
+		}
+	}
+}
+
+func TestRotateProxyNeverServedFirst(t *testing.T) {
+	db := mustOpen(t)
+	proxies := seedProxies(t, db, 3)
+
+	// Mark the first proxy as served long ago; the other two have never been
+	// served and must both come out before it is revisited.
+	if _, err := db.db.Exec("UPDATE proxies SET last_served_at = ? WHERE id = ?",
+		time.Now().UTC().Add(-24*time.Hour), proxies[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == proxies[0].ID {
+		t.Fatalf("expected a never-served proxy first, got the previously served one (id %d)", first.ID)
+	}
+	second, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == proxies[0].ID {
+		t.Fatalf("expected the other never-served proxy second, got id %d", second.ID)
+	}
+	third, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.ID != proxies[0].ID {
+		t.Fatalf("expected the previously served proxy third, got id %d", third.ID)
+	}
+}
+
+func TestRotateProxyStampsServeMetadata(t *testing.T) {
+	db := mustOpen(t)
+	seedProxies(t, db, 1)
+
+	before := time.Now().UTC().Add(-time.Second)
+	p, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ServeCount != 1 {
+		t.Errorf("expected serve_count 1 on first rotation, got %d", p.ServeCount)
+	}
+	if p.LastServedAt == nil {
+		t.Fatal("expected last_served_at to be set")
+	}
+	if p.LastServedAt.Before(before) {
+		t.Errorf("last_served_at %v is older than the start of the test %v", p.LastServedAt, before)
+	}
+
+	p2, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.ServeCount != 2 {
+		t.Errorf("expected serve_count 2 on second rotation, got %d", p2.ServeCount)
+	}
+}
+
+func TestRotateProxyRespectsFilters(t *testing.T) {
+	db := mustOpen(t)
+	seedProxies(t, db, 2)
+
+	// Add a SOCKS4 proxy in a different country.
+	if err := db.UpsertProxy(&proxy.Proxy{
+		IP: "10.0.0.2", Port: 1081, Protocol: proxy.ProtocolSOCKS4,
+		Country: "DE", LatencyMs: 50, Alive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 4; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{Protocol: proxy.ProtocolSOCKS4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p == nil {
+			t.Fatal("expected the socks4 proxy, got nil")
+		}
+		if p.Protocol != proxy.ProtocolSOCKS4 {
+			t.Fatalf("filter ignored: got protocol %s", p.Protocol)
+		}
+	}
+
+	p, err := db.RotateProxy(proxy.ProxyFilter{Country: "DE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p == nil || p.Country != "DE" {
+		t.Fatalf("expected a DE proxy, got %+v", p)
+	}
+}
+
+func TestRotateProxyExcludesStale(t *testing.T) {
+	db := mustOpen(t)
+	proxies := seedProxies(t, db, 2)
+
+	if _, err := db.db.Exec("UPDATE proxies SET status = 'stale' WHERE id = ?", proxies[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		p, err := db.RotateProxy(proxy.ProxyFilter{Status: proxy.ProxyStatusActive})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p == nil {
+			t.Fatal("expected the active proxy")
+		}
+		if p.ID == proxies[0].ID {
+			t.Fatal("rotation returned a stale proxy when filtering for active")
+		}
+	}
+}
+
+func TestRotateProxyEmptyPool(t *testing.T) {
+	db := mustOpen(t)
+	p, err := db.RotateProxy(proxy.ProxyFilter{})
+	if err != nil {
+		t.Fatalf("expected no error on empty pool, got %v", err)
+	}
+	if p != nil {
+		t.Fatalf("expected nil proxy on empty pool, got %+v", p)
+	}
+}
+
+func TestRotateProxyNoMatchingFilter(t *testing.T) {
+	db := mustOpen(t)
+	seedProxies(t, db, 2)
+
+	p, err := db.RotateProxy(proxy.ProxyFilter{Country: "ZZ"})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if p != nil {
+		t.Fatalf("expected nil for a filter matching nothing, got %+v", p)
+	}
+}
+
+// TestRotateProxyConcurrent asserts that concurrent callers never receive the
+// same proxy: the claim and the serve stamp happen in one statement.
+func TestRotateProxyConcurrent(t *testing.T) {
+	db := mustOpen(t)
+	const n = 20
+	seedProxies(t, db, n)
+
+	type result struct {
+		id  int64
+		err error
+	}
+	results := make(chan result, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			p, err := db.RotateProxy(proxy.ProxyFilter{})
+			if err != nil || p == nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{id: p.ID}
+		}()
+	}
+	close(start)
+
+	seen := map[int64]bool{}
+	for i := 0; i < n; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("concurrent rotate failed: %v", r.err)
+		}
+		if r.id == 0 {
+			t.Fatal("concurrent rotate returned no proxy while the pool was non-empty")
+		}
+		if seen[r.id] {
+			t.Fatalf("proxy %d handed out twice across %d concurrent rotations", r.id, n)
+		}
+		seen[r.id] = true
 	}
 }

@@ -1,0 +1,28 @@
+# Drains the candidates queue that the scanner filled: negotiates SOCKS against
+# each candidate, enforces EFnet eligibility, and writes surviving proxies to
+# SQLite. This is a batch job — it exits once the queue is empty.
+#
+# Normally triggered by OnSuccess= in proxy-scanner-scan.service the moment a
+# sweep session finishes. proxy-scanner-validate.timer is a safety net for the
+# case where a scan was skipped but candidates are still pending.
+[Unit]
+Description=Proxy scanner candidate validator
+Documentation=https://github.com/venatiodecorus/proxy-scanner
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/proxy-scanner
+ExecStart=/usr/bin/docker compose --profile scan run --rm --name proxy-scanner-validate-run validator
+# The validator handles SIGTERM by cancelling its context and letting workers
+# drain, so the systemd default is correct here.
+TimeoutStopSec=2min
+# A large backlog with WORKERS=500 can take hours. Generous, but bounded.
+TimeoutStartSec=12h
+ExecStopPost=-/usr/bin/docker rm -f proxy-scanner-validate-run
+SyslogIdentifier=proxy-scanner-validate
+
+[Install]
+WantedBy=multi-user.target

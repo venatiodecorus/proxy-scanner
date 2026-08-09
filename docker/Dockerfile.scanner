@@ -53,6 +53,13 @@ RUN mkdir -p /data /config
 # Copy all exclude list fragments and merge them at build time.
 # This strips comments and blank lines to produce a clean CIDR-only file
 # that masscan can parse without issues.
+#
+# The build fails if the merge produces an implausibly short list. The scanner
+# targets 0.0.0.0/0, so a truncated exclusion file means scanning military and
+# government networks — better to break the image build than to ship it. The
+# scanner binary repeats this check at startup and additionally verifies that
+# specific canary addresses are covered (see cmd/scanner/exclude.go).
+ARG MIN_EXCLUDE_ENTRIES=2000
 COPY config/exclude/ /config/exclude.d/
 RUN cat /config/exclude.d/*.conf \
     | grep -v '^#' \
@@ -62,7 +69,12 @@ RUN cat /config/exclude.d/*.conf \
     | grep -v '^$' \
     > /config/exclude.conf \
     && rm -rf /config/exclude.d/ \
-    && echo "Exclude list entries: $(wc -l < /config/exclude.conf)"
+    && ENTRIES=$(wc -l < /config/exclude.conf) \
+    && echo "Exclude list entries: ${ENTRIES}" \
+    && if [ "${ENTRIES}" -lt "${MIN_EXCLUDE_ENTRIES}" ]; then \
+         echo "FATAL: merged exclude list has ${ENTRIES} entries, expected >= ${MIN_EXCLUDE_ENTRIES}" >&2; \
+         exit 1; \
+       fi
 
 COPY --from=masscan-builder /masscan/bin/masscan /usr/local/bin/masscan
 COPY --from=builder /scanner /usr/local/bin/scanner

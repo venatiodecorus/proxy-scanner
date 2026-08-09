@@ -1,0 +1,36 @@
+# Build stage
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache gcc musl-dev
+
+WORKDIR /build
+
+# Cache dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Build
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /revalidator ./cmd/revalidator/
+
+# Runtime stage
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=builder /revalidator /usr/local/bin/revalidator
+
+# Bundle GeoLite2 databases into the image for parity with the validator.
+# The revalidator currently doesn't refresh geo data on rechecks, but the
+# proxy.GeoIPLookup constructor expects the files to exist; bundling avoids
+# diverging behavior if we later decide to refresh geo on revalidation.
+COPY data/GeoLite2-City.mmdb /geoip/GeoLite2-City.mmdb
+COPY data/GeoLite2-ASN.mmdb /geoip/GeoLite2-ASN.mmdb
+COPY data/GeoLite2-Country.mmdb /geoip/GeoLite2-Country.mmdb
+
+# Create data directory for runtime artifacts (PVC mount point)
+RUN mkdir -p /data
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/local/bin/revalidator"]

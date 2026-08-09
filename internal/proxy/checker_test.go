@@ -97,6 +97,23 @@ func TestExtractHost(t *testing.T) {
 	}
 }
 
+func TestHTTPRequestTarget(t *testing.T) {
+	host, requestURI, err := httpRequestTarget("http://httpbin.org/ip?source=validator")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if host != "httpbin.org" {
+		t.Fatalf("expected host httpbin.org, got %q", host)
+	}
+	if requestURI != "/ip?source=validator" {
+		t.Fatalf("expected request URI /ip?source=validator, got %q", requestURI)
+	}
+
+	if _, _, err := httpRequestTarget("not-a-url"); err == nil {
+		t.Fatal("expected URL without a host to fail")
+	}
+}
+
 func TestSplitHostPort(t *testing.T) {
 	tests := []struct {
 		input       string

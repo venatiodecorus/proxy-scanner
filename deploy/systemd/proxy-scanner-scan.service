@@ -1,0 +1,47 @@
+# One masscan session. SCAN_TIMEOUT (4h in docker-compose.yml) bounds the run;
+# masscan saves /data/paused.conf on the way out and the next session resumes
+# from there. A full IPv4 sweep is ~56h of scan time, so ~14 sessions.
+#
+# No flock needed here, unlike the cron setup this replaces: systemd will not
+# start a second instance of a unit that is already active, so overlapping
+# sessions — which would corrupt paused.conf and double the packet rate — are
+# structurally impossible.
+[Unit]
+Description=Proxy scanner masscan sweep (one session)
+Documentation=https://github.com/venatiodecorus/proxy-scanner
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# Drain the candidate queue as soon as the sweep finishes, rather than hoping a
+# fixed clock time lands after it. OnSuccess= is a [Unit] directive and requires
+# systemd 249+ (Debian 12 ships 252).
+#
+# proxy-scanner-validate.service also has its own daily timer as a safety net;
+# systemd refuses to start a unit twice concurrently, so the two triggers cannot
+# collide.
+OnSuccess=proxy-scanner-validate.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/proxy-scanner
+# --profile scan is required: the scanner service is profile-gated and Compose
+# silently ignores it otherwise.
+ExecStart=/usr/bin/docker compose --profile scan run --rm --name proxy-scanner-scan-run scanner
+
+# masscan only writes its resume file on SIGINT. A SIGTERM kills it outright and
+# you lose the session's progress, so `systemctl stop` must deliver SIGINT.
+# The scanner process forwards whatever signal it receives on to masscan.
+KillSignal=SIGINT
+# Give masscan room to flush paused.conf before systemd escalates to SIGKILL.
+TimeoutStopSec=5min
+# Type=oneshot disables the start timeout by default. Set an explicit ceiling
+# above SCAN_TIMEOUT so a wedged masscan is eventually reaped instead of
+# blocking the timer forever.
+TimeoutStartSec=6h
+# If systemd had to hard-kill the docker CLI, --rm never fired; clean up the
+# orphaned container so the next session's --name is free.
+ExecStopPost=-/usr/bin/docker rm -f proxy-scanner-scan-run
+SyslogIdentifier=proxy-scanner-scan
+
+[Install]
+WantedBy=multi-user.target

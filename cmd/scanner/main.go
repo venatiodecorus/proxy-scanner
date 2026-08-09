@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,6 +17,8 @@ import (
 	"github.com/venatiodecorus/proxy-scanner/internal/proxy"
 	"github.com/venatiodecorus/proxy-scanner/internal/scanner"
 )
+
+const progressLogInterval = 15 * time.Minute
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -29,8 +34,12 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	scanRate := envOrDefaultInt("SCAN_RATE", 50000)
-	scanPorts := envOrDefault("SCAN_PORTS", "3128,8080,1080,8888,9050,8443,3129,80,443,1081")
-	scanAdapter := envOrDefault("SCAN_ADAPTER", "ens3")
+	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,9050")
+	// Empty means "let masscan pick the default-route interface". There is
+	// deliberately no default here: hardcoding an interface name (it used to be
+	// the OpenStack-specific "ens3") makes the scanner fail on any host that
+	// names its NIC differently.
+	scanAdapter := os.Getenv("SCAN_ADAPTER")
 	excludeFile := envOrDefault("EXCLUDE_FILE", "/config/exclude.conf")
 	dbPath := envOrDefault("DB_PATH", "/data/proxies.db")
 	outputFile := envOrDefault("OUTPUT_FILE", "/data/candidates.json")
@@ -48,22 +57,26 @@ func run(logger *slog.Logger) error {
 		"scan_timeout", scanTimeout,
 	)
 
+	// Fail closed: we scan 0.0.0.0/0, so an incomplete or missing exclusion list
+	// means scanning military, government and infrastructure networks. Validate
+	// before masscan gets a chance to send a single packet.
+	if err := validateExcludeFile(excludeFile, logger); err != nil {
+		return fmt.Errorf("exclude file preflight failed: %w", err)
+	}
+
 	db, err := database.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
 	defer db.Close()
 
-	masscanArgs := []string{
-		"0.0.0.0/0",
-		"-p" + scanPorts,
-		"--excludefile", excludeFile,
-		"--rate", strconv.Itoa(scanRate),
-		"--adapter", scanAdapter,
-		"--open",
-		"-oJ", outputFile,
-		"--source-port", "40000-56383",
-	}
+	masscanArgs := buildMasscanArgs(masscanConfig{
+		ports:       scanPorts,
+		excludeFile: excludeFile,
+		rate:        scanRate,
+		adapter:     scanAdapter,
+		outputFile:  outputFile,
+	})
 
 	resuming := false
 	if _, err := os.Stat(resumeFile); err == nil {
@@ -95,6 +108,9 @@ func run(logger *slog.Logger) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting masscan: %w", err)
 	}
+
+	stopProgress := startScannerProgress(logger, db, outputFile, time.Now())
+	defer stopProgress()
 
 	done := make(chan error, 1)
 	go func() {
@@ -157,6 +173,108 @@ func run(logger *slog.Logger) error {
 	}
 
 	return parseAndEnqueue(logger, db, outputFile)
+}
+
+// masscanConfig is the set of knobs that shape the masscan command line.
+type masscanConfig struct {
+	ports       string
+	excludeFile string
+	rate        int
+	adapter     string
+	outputFile  string
+}
+
+// buildMasscanArgs assembles the masscan invocation. The target is always
+// 0.0.0.0/0 and --excludefile is always present — the exclusion list, validated
+// separately by validateExcludeFile, is what keeps that target safe.
+//
+// adapter is optional: when empty, the flag is omitted entirely and masscan
+// picks the default-route interface itself. Passing a wrong interface name is a
+// hard failure, so "unset" has to mean "auto-detect" rather than some guess
+// baked into the binary.
+func buildMasscanArgs(cfg masscanConfig) []string {
+	args := []string{
+		"0.0.0.0/0",
+		"-p" + cfg.ports,
+		"--excludefile", cfg.excludeFile,
+		"--rate", strconv.Itoa(cfg.rate),
+		"--open",
+		"-oJ", cfg.outputFile,
+		"--source-port", "40000-56383",
+	}
+	if cfg.adapter != "" {
+		args = append(args, "--adapter", cfg.adapter)
+	}
+	return args
+}
+
+// startScannerProgress logs approximate masscan output and queue totals at a
+// low frequency while the scanner process is running.
+func startScannerProgress(logger *slog.Logger, db *database.DB, outputFile string, started time.Time) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(progressLogInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				records, size, err := scanOutputTotals(outputFile)
+				if err != nil {
+					logger.Warn("failed to read scan progress", "file", outputFile, "error", err)
+					continue
+				}
+				pending, err := db.PendingCandidateCount()
+				if err != nil {
+					logger.Warn("failed to read pending candidate total", "error", err)
+				}
+				logger.Info("scanner progress",
+					"elapsed", time.Since(started).Round(time.Second),
+					"masscan_records", records,
+					"output_bytes", size,
+					"pending_in_queue", pending,
+				)
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func scanOutputTotals(outputFile string) (records int64, size int64, err error) {
+	f, err := os.Open(outputFile)
+	if os.IsNotExist(err) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("opening output file: %w", err)
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stating output file: %w", err)
+	}
+
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 64*1024), 1024*1024)
+	for s.Scan() {
+		if bytes.Contains(s.Bytes(), []byte(`"ip"`)) {
+			records++
+		}
+	}
+	if err := s.Err(); err != nil {
+		return 0, st.Size(), fmt.Errorf("counting output records: %w", err)
+	}
+	return records, st.Size(), nil
 }
 
 // outputFileIsFresh reports whether outputFile has been modified since
