@@ -88,7 +88,12 @@ SCAN_TIMEOUT=4h
 docker compose --profile scan up scanner
 ```
 
-Masscan randomizes scan order by default, so resumed scans won't re-scan previously covered segments.
+Two details of how this build of masscan resumes, both of which the scanner has to work around:
+
+- **Progress lives in the range list, not an index.** `paused.conf` records the *remaining* ranges — there is no `resume-index`. Because masscan treats target ranges as additive, passing `0.0.0.0/0` alongside `--resume` unions the whole address space back in and silently discards all prior progress. `buildMasscanArgs` therefore emits *either* `--resume` *or* a bare target, never both. A resumed session reports fewer hosts than a fresh one; if you ever see a resumed run report the full in-scope count, resume is broken again.
+- **Excludes are not saved.** masscan does not persist `--excludefile` into `paused.conf` (upstream [#110](https://github.com/robertdavidgraham/masscan/issues/110)), so it is re-specified on every invocation, resume included.
+
+When a sweep finishes, the scanner deletes `paused.conf` so the next session starts a fresh pass. masscan only writes that file when interrupted and never clears a stale one, so without this the next session would resume an already-complete sweep and rescan its final chunk indefinitely.
 
 ### How long a full sweep takes
 
@@ -131,20 +136,46 @@ masscan brings its own IP stack and sends from `--source-port 40000-56383`. The 
 
 Scans work without the rule, so `deploy/install.sh` does not apply it unprompted. Do it before a real sweep.
 
-### Add
+> **Do not add the drop rule on its own.** Linux hands out ephemeral source ports
+> from `32768–60999` by default (`sysctl net.ipv4.ip_local_port_range`), which
+> overlaps `40000–56383`. A bare `tcp dport 40000-56383 drop` on the input hook
+> therefore discards the *return traffic* of any outbound connection that happened
+> to pick a source port in that window — roughly 58% of them. The symptom is
+> outbound connections hanging rather than failing: `docker pull` stalls, `apt
+> update` stalls. Step 1 below is what makes the rule safe.
+
+### Step 1 — reserve the range from ephemeral allocation
+
+```sh
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=40000-56383
+echo 'net.ipv4.ip_local_reserved_ports = 40000-56383' | sudo tee /etc/sysctl.d/99-masscan.conf
+```
+
+`ip_local_reserved_ports` excludes those ports from automatic assignment, so no
+local socket will ever source from them.
+
+### Step 2 — add the rule
 
 The rule goes in its own nftables table. That matters for two reasons: a minimal Debian install may have no `inet filter` table to append to, and a dedicated table can be removed in one command without touching anything else's rules.
 
 ```sh
 sudo nft add table inet masscan
 sudo nft add chain inet masscan input '{ type filter hook input priority -10; policy accept; }'
+sudo nft add rule inet masscan input ct state established,related accept
 sudo nft add rule inet masscan input tcp dport 40000-56383 counter drop
 ```
 
-Verify — the counter should climb while a scan is running:
+The `ct state established,related accept` is belt-and-braces alongside step 1, and
+must come first — nftables evaluates rules in insertion order. `accept` in a base
+chain is not terminal, so packets still traverse chains at higher priority
+numbers and this does not bypass any other firewalling on the host.
+
+Verify. The counter should climb while a scan runs, and normal outbound traffic
+should be unaffected:
 
 ```sh
 sudo nft list table inet masscan
+docker pull alpine && echo "outbound still works"
 ```
 
 Make it survive a reboot by appending the table to `/etc/nftables.conf`:
@@ -153,9 +184,11 @@ Make it survive a reboot by appending the table to `/etc/nftables.conf`:
 sudo tee -a /etc/nftables.conf >/dev/null <<'EOF'
 
 # Drop kernel responses on masscan's source-port range (see README).
+# Safe only in combination with net.ipv4.ip_local_reserved_ports=40000-56383.
 table inet masscan {
     chain input {
         type filter hook input priority -10; policy accept;
+        ct state established,related accept
         tcp dport 40000-56383 counter drop
     }
 }
@@ -169,6 +202,10 @@ sudo nft -c -f /etc/nftables.conf && echo "nftables.conf is valid"
 ```sh
 # Drop it from the running ruleset
 sudo nft delete table inet masscan
+
+# And release the reserved port range
+sudo rm -f /etc/sysctl.d/99-masscan.conf
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=
 ```
 
 Then delete the `table inet masscan { ... }` block from `/etc/nftables.conf` so it does not come back on reboot, and re-validate:
@@ -185,11 +222,13 @@ sudo nft list table inet masscan
 
 ### iptables hosts
 
-If the box uses iptables rather than nftables, the add and remove are symmetric — `-I` to insert, `-D` with the identical rule spec to delete:
+If the box uses iptables rather than nftables, do step 1 the same way, then insert the conntrack accept *above* the drop (`-I` prepends, so insert the drop first):
 
 ```sh
-sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP   # add
-sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP   # remove
+sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP                     # add
+sudo iptables -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT   # then this, above it
+
+sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP                     # remove
 ```
 
 Persist with `iptables-save > /etc/iptables/rules.v4` (package `iptables-persistent`).

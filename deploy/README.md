@@ -102,16 +102,36 @@ The rule lives in its own table rather than being appended to `inet filter`: a
 minimal Debian install may have no such table, and a dedicated one can be removed
 in a single command without disturbing anything else.
 
-### Add
+**The drop rule is unsafe on its own.** Linux allocates ephemeral source ports
+from `32768-60999` by default, which overlaps `40000-56383`. A bare
+`tcp dport 40000-56383 drop` on the input hook discards the return traffic of any
+outbound connection that picked a source port in that window — about 58% of them.
+Outbound connections then *hang* rather than fail: `docker pull` and `apt update`
+stall with no error. Step 1 is what makes the rule safe; do not skip it.
+
+### Step 1 — keep the kernel off those ports
+
+```sh
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=40000-56383
+echo 'net.ipv4.ip_local_reserved_ports = 40000-56383' | sudo tee /etc/sysctl.d/99-masscan.conf
+```
+
+### Step 2 — add the rule
 
 ```sh
 sudo nft add table inet masscan
 sudo nft add chain inet masscan input '{ type filter hook input priority -10; policy accept; }'
+sudo nft add rule inet masscan input ct state established,related accept
 sudo nft add rule inet masscan input tcp dport 40000-56383 counter drop
 
-# Verify — the counter climbs while a scan runs
+# Verify: counter climbs while a scan runs, and outbound still works
 sudo nft list table inet masscan
+docker pull alpine && echo "outbound still works"
 ```
+
+The conntrack accept must be added before the drop — nftables evaluates in
+insertion order. `accept` in a base chain is not terminal, so packets still
+traverse chains at higher priority numbers and other firewalling is unaffected.
 
 Persist across reboots:
 
@@ -119,9 +139,11 @@ Persist across reboots:
 sudo tee -a /etc/nftables.conf >/dev/null <<'EOF'
 
 # Drop kernel responses on masscan's source-port range.
+# Safe only alongside net.ipv4.ip_local_reserved_ports=40000-56383.
 table inet masscan {
     chain input {
         type filter hook input priority -10; policy accept;
+        ct state established,related accept
         tcp dport 40000-56383 counter drop
     }
 }
@@ -135,6 +157,9 @@ sudo nft -c -f /etc/nftables.conf && echo "nftables.conf is valid"
 ```sh
 sudo nft delete table inet masscan          # running ruleset
 sudo nft list table inet masscan            # should report no such table
+
+sudo rm -f /etc/sysctl.d/99-masscan.conf    # release the reserved ports
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=
 ```
 
 Then delete the `table inet masscan { ... }` block from `/etc/nftables.conf` and
@@ -143,15 +168,28 @@ next reboot.
 
 ### iptables hosts
 
-Add and remove are symmetric — same rule spec, `-I` versus `-D`:
+Do step 1 identically, then insert the drop and put the conntrack accept above it
+(`-I` prepends, so add the drop first):
 
 ```sh
-sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP   # add
-sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP   # remove
+sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP
+sudo iptables -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP    # remove
 ```
 
 Persist with `iptables-save > /etc/iptables/rules.v4` (package
 `iptables-persistent`).
+
+### Symptom cheat-sheet
+
+If outbound connections on the host start hanging, check this rule first:
+
+```sh
+sudo nft list table inet masscan            # is the drop counter climbing on non-scan traffic?
+sysctl net.ipv4.ip_local_reserved_ports     # should be 40000-56383
+sudo nft delete table inet masscan          # removes it instantly if you need to bisect
+```
 
 ## Layout
 
@@ -180,6 +218,41 @@ On the host:
 Persistent data lives in the `scanner-data` Docker volume mounted at `/data`
 (SQLite database, masscan resume state, candidate JSON).
 
+## Permissions, and why compose commands need sudo
+
+`install.sh` lays the directory out like this:
+
+```
+drwxr-xr-x root root  /opt/proxy-scanner/
+-rw-r--r-- root root  docker-compose.yml
+-rw------- root root  .env
+-rwxr-xr-x root root  update.sh
+```
+
+`.env` is `0600 root:root` on purpose — it can hold `API_TOKEN`. Compose reads
+`.env` for `${VAR}` substitution *before* it ever contacts the daemon, so running
+`docker compose` here as a normal user fails with:
+
+```
+open /opt/proxy-scanner/.env: permission denied
+```
+
+That is expected. Run compose commands under `sudo` rather than loosening `.env`
+to `0644`, which would publish the API token to every user on the box:
+
+```sh
+cd /opt/proxy-scanner
+sudo docker compose ps
+```
+
+`sudo` keeps the working directory, so Compose still finds `docker-compose.yml`
+and `.env` alongside each other.
+
+The systemd units are unaffected either way: none of them set `User=`, so they all
+run as root and can read `.env` directly. Being in the `docker` group is *not*
+enough on its own — that grants daemon access, not read access to a root-only
+file.
+
 ## Day-to-day
 
 ```sh
@@ -187,17 +260,24 @@ Persistent data lives in the `scanner-data` Docker volume mounted at `/data`
 systemctl list-timers 'proxy-scanner*'
 
 # Run a scan session right now (ignores the timer)
-systemctl start proxy-scanner-scan.service
+sudo systemctl start proxy-scanner-scan.service
 
 # Follow a running session
 journalctl -fu proxy-scanner-scan.service
 
 # Stop a session gracefully — masscan saves paused.conf and the next
 # session resumes from there
-systemctl stop proxy-scanner-scan.service
+sudo systemctl stop proxy-scanner-scan.service
 
 # Validate whatever is queued, without waiting for the timer
-systemctl start proxy-scanner-validate.service
+sudo systemctl start proxy-scanner-validate.service
+
+# Container state (needs sudo: reads .env)
+cd /opt/proxy-scanner && sudo docker compose --profile scan ps -a
+
+# Run a short scan session in the foreground, overriding the 4h timeout
+cd /opt/proxy-scanner
+sudo docker compose --profile scan run --rm -e SCAN_TIMEOUT=3m -e SCAN_RATE=20000 scanner
 
 # Pull new images and restart the API/revalidator
 sudo /opt/proxy-scanner/update.sh
