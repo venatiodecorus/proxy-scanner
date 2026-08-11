@@ -34,7 +34,7 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	scanRate := envOrDefaultInt("SCAN_RATE", 50000)
-	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,9050")
+	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,4145,9050")
 	// Empty means "let masscan pick the default-route interface". There is
 	// deliberately no default here: hardcoding an interface name (it used to be
 	// the OpenStack-specific "ens3") makes the scanner fail on any host that
@@ -70,20 +70,24 @@ func run(logger *slog.Logger) error {
 	}
 	defer db.Close()
 
+	// Resolve resume state *before* building the argument list. On a resume the
+	// target ranges come out of paused.conf and must not also be given on the
+	// command line — see buildMasscanArgs.
+	resumeArg := ""
+	if _, err := os.Stat(resumeFile); err == nil {
+		logger.Info("found resume file, continuing previous scan", "file", resumeFile)
+		resumeArg = resumeFile
+	}
+	resuming := resumeArg != ""
+
 	masscanArgs := buildMasscanArgs(masscanConfig{
 		ports:       scanPorts,
 		excludeFile: excludeFile,
 		rate:        scanRate,
 		adapter:     scanAdapter,
 		outputFile:  outputFile,
+		resumeFile:  resumeArg,
 	})
-
-	resuming := false
-	if _, err := os.Stat(resumeFile); err == nil {
-		logger.Info("found resume file, continuing previous scan", "file", resumeFile)
-		masscanArgs = append([]string{"--resume", resumeFile}, masscanArgs...)
-		resuming = true
-	}
 
 	cmd := exec.Command("masscan", masscanArgs...)
 	cmd.Stdout = os.Stdout
@@ -144,6 +148,19 @@ func run(logger *slog.Logger) error {
 		}
 		logger.Info("masscan completed naturally")
 
+		// The sweep finished, so there is nothing left to resume. masscan writes
+		// paused.conf only when it is interrupted and never clears a stale one, so
+		// leaving the previous session's file behind would make the next session
+		// resume an already-finished sweep — rescanning its final chunk forever
+		// instead of starting a new pass over the address space.
+		if err := os.Remove(resumeFile); err == nil {
+			logger.Info("sweep complete, cleared resume state; next session starts a fresh pass",
+				"file", resumeFile)
+		} else if !os.IsNotExist(err) {
+			logger.Warn("failed to clear resume file after a completed sweep",
+				"file", resumeFile, "error", err)
+		}
+
 	case <-timeoutCh:
 		logger.Info("scan timeout reached, sending SIGINT to masscan", "timeout", scanTimeout)
 		if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
@@ -182,26 +199,53 @@ type masscanConfig struct {
 	rate        int
 	adapter     string
 	outputFile  string
+	// resumeFile, when set, makes this a resumed session: masscan reads the
+	// unscanned remainder from that file instead of being given a target.
+	resumeFile string
 }
 
-// buildMasscanArgs assembles the masscan invocation. The target is always
-// 0.0.0.0/0 and --excludefile is always present — the exclusion list, validated
-// separately by validateExcludeFile, is what keeps that target safe.
+// buildMasscanArgs assembles the masscan invocation.
+//
+// Target selection is the subtle part. masscan treats target ranges as
+// ADDITIVE — every range on the command line is unioned into the set. This
+// build of masscan records its progress in paused.conf as the list of *remaining*
+// ranges (there is no resume-index), so passing "0.0.0.0/0" alongside --resume
+// unions the whole address space back in and silently discards everything the
+// previous sessions covered. Every session then rescans the same opening slice
+// and the sweep never advances.
+//
+// So: exactly one of --resume or a bare target, never both.
+//
+// --excludefile is always present, on both paths. masscan does not persist
+// excludes into paused.conf (upstream issue #110) and refuses a large scan
+// without at least one exclude, so it has to be re-specified on a resume — and
+// it is what keeps the resumed range set safe. The exclusion list is validated
+// separately by validateExcludeFile before we get here.
+//
+// The remaining flags are scalars (--rate, -oJ, --adapter) or an identical set
+// (-p), so re-specifying them on a resume is harmless; only the range list
+// accumulates.
 //
 // adapter is optional: when empty, the flag is omitted entirely and masscan
 // picks the default-route interface itself. Passing a wrong interface name is a
 // hard failure, so "unset" has to mean "auto-detect" rather than some guess
 // baked into the binary.
 func buildMasscanArgs(cfg masscanConfig) []string {
-	args := []string{
-		"0.0.0.0/0",
-		"-p" + cfg.ports,
+	var args []string
+	if cfg.resumeFile != "" {
+		args = append(args, "--resume", cfg.resumeFile)
+	} else {
+		args = append(args, "0.0.0.0/0")
+	}
+
+	args = append(args,
+		"-p"+cfg.ports,
 		"--excludefile", cfg.excludeFile,
 		"--rate", strconv.Itoa(cfg.rate),
 		"--open",
 		"-oJ", cfg.outputFile,
 		"--source-port", "40000-56383",
-	}
+	)
 	if cfg.adapter != "" {
 		args = append(args, "--adapter", cfg.adapter)
 	}

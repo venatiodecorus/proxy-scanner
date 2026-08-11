@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Configuration via environment variables
 SCAN_RATE="${SCAN_RATE:-50000}"
-SCAN_PORTS="${SCAN_PORTS:-1080,1081,9050}"
+SCAN_PORTS="${SCAN_PORTS:-1080,1081,4145,9050}"
 SCAN_ADAPTER="${SCAN_ADAPTER:-ens3}"
 EXCLUDE_FILE="${EXCLUDE_FILE:-/config/exclude.conf}"
 OUTPUT_FILE="${OUTPUT_FILE:-/data/candidates.json}"

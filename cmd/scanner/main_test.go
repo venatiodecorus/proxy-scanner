@@ -40,7 +40,7 @@ func TestScanOutputTotalsMissingFile(t *testing.T) {
 
 func TestBuildMasscanArgsOmitsAdapterWhenUnset(t *testing.T) {
 	args := buildMasscanArgs(masscanConfig{
-		ports:       "1080,1081,9050",
+		ports:       "1080,1081,4145,9050",
 		excludeFile: "/config/exclude.conf",
 		rate:        50000,
 		adapter:     "",
@@ -77,20 +77,71 @@ func TestBuildMasscanArgsIncludesAdapterWhenSet(t *testing.T) {
 	}
 }
 
-// The target and the exclusion file are the safety contract: masscan must never
-// be invoked against 0.0.0.0/0 without --excludefile.
+// --excludefile is the safety contract and must be present on every path,
+// including a resume: masscan does not persist excludes into paused.conf.
 func TestBuildMasscanArgsAlwaysExcludes(t *testing.T) {
 	for _, adapter := range []string{"", "eth0"} {
+		for _, resume := range []string{"", "/data/paused.conf"} {
+			args := buildMasscanArgs(masscanConfig{
+				ports: "1080", excludeFile: "/config/exclude.conf", rate: 1000,
+				adapter: adapter, outputFile: "/data/candidates.json", resumeFile: resume,
+			})
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, "--excludefile /config/exclude.conf") {
+				t.Errorf("adapter=%q resume=%q: --excludefile missing from %s", adapter, resume, joined)
+			}
+		}
+	}
+}
+
+// A fresh scan targets the whole address space explicitly.
+func TestBuildMasscanArgsFreshScanTargetsEverything(t *testing.T) {
+	args := buildMasscanArgs(masscanConfig{
+		ports: "1080", excludeFile: "/config/exclude.conf", rate: 1000,
+		outputFile: "/data/candidates.json",
+	})
+	if args[0] != "0.0.0.0/0" {
+		t.Fatalf("expected 0.0.0.0/0 as the target, got %q (%v)", args[0], args)
+	}
+	if strings.Contains(strings.Join(args, " "), "--resume") {
+		t.Fatalf("a fresh scan must not pass --resume: %v", args)
+	}
+}
+
+// The regression this guards is subtle and cost a wasted sweep: masscan unions
+// every target range it is given, and this build stores progress in paused.conf
+// as the list of *remaining* ranges. Passing a bare 0.0.0.0/0 alongside --resume
+// therefore restores the already-scanned space and the sweep never advances.
+func TestBuildMasscanArgsResumeOmitsTarget(t *testing.T) {
+	args := buildMasscanArgs(masscanConfig{
+		ports: "1080,1081,4145,9050", excludeFile: "/config/exclude.conf", rate: 50000,
+		outputFile: "/data/candidates.json", resumeFile: "/data/paused.conf",
+	})
+
+	for _, a := range args {
+		if a == "0.0.0.0/0" {
+			t.Fatalf("resume must not re-specify a target range; it is unioned with "+
+				"paused.conf's remainder and wipes scan progress: %v", args)
+		}
+	}
+	if args[0] != "--resume" || args[1] != "/data/paused.conf" {
+		t.Fatalf("expected --resume first, got %v", args)
+	}
+}
+
+// Resume and a bare target are mutually exclusive: exactly one is always present.
+func TestBuildMasscanArgsTargetIsExclusive(t *testing.T) {
+	for _, resume := range []string{"", "/data/paused.conf"} {
 		args := buildMasscanArgs(masscanConfig{
 			ports: "1080", excludeFile: "/config/exclude.conf", rate: 1000,
-			adapter: adapter, outputFile: "/data/candidates.json",
+			outputFile: "/data/candidates.json", resumeFile: resume,
 		})
-		if args[0] != "0.0.0.0/0" {
-			t.Errorf("adapter=%q: expected 0.0.0.0/0 as the target, got %q", adapter, args[0])
-		}
 		joined := strings.Join(args, " ")
-		if !strings.Contains(joined, "--excludefile /config/exclude.conf") {
-			t.Errorf("adapter=%q: --excludefile missing from %s", adapter, joined)
+		hasTarget := strings.Contains(joined, "0.0.0.0/0")
+		hasResume := strings.Contains(joined, "--resume")
+		if hasTarget == hasResume {
+			t.Errorf("resume=%q: expected exactly one of a target or --resume, got target=%v resume=%v in %v",
+				resume, hasTarget, hasResume, args)
 		}
 	}
 }

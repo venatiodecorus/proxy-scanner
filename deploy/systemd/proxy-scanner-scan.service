@@ -1,6 +1,6 @@
 # One masscan session. SCAN_TIMEOUT (4h in docker-compose.yml) bounds the run;
 # masscan saves /data/paused.conf on the way out and the next session resumes
-# from there. A full IPv4 sweep is ~56h of scan time, so ~14 sessions.
+# from there. A full IPv4 sweep is ~75h of scan time, so ~19 sessions.
 #
 # No flock needed here, unlike the cron setup this replaces: systemd will not
 # start a second instance of a unit that is already active, so overlapping

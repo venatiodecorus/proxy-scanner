@@ -81,6 +81,10 @@ info "update.sh"
 if [[ -f "${INSTALL_DIR}/.env" ]]; then
     info ".env already present — left untouched"
 else
+    # 0600 root:root: this file can hold API_TOKEN. The systemd units all run as
+    # root so they can read it, but it does mean interactive `docker compose`
+    # commands in this directory need sudo — Compose parses .env before it talks
+    # to the daemon, so docker group membership alone is not enough.
     install -m 0600 "${REPO_ROOT}/deploy/env.example" "${INSTALL_DIR}/.env"
     info ".env seeded from deploy/env.example (review it)"
     NEEDS_ENV=1
@@ -181,10 +185,14 @@ echo "  * masscan will auto-detect its interface; the default route is via '${DE
 echo "    Set SCAN_ADAPTER in .env only if that is wrong."
 echo "  * Recommended before the first real sweep: stop the kernel from answering"
 echo "    masscan's source ports, so it does not RST the hosts you are probing."
+echo "    Reserve the range FIRST or you will break outbound connections on this"
+echo "    host — the default ephemeral range (32768-60999) overlaps it:"
+echo "      sysctl -w net.ipv4.ip_local_reserved_ports=40000-56383"
 echo "      nft add table inet masscan"
 echo "      nft add chain inet masscan input '{ type filter hook input priority -10; policy accept; }'"
+echo "      nft add rule inet masscan input ct state established,related accept"
 echo "      nft add rule inet masscan input tcp dport 40000-56383 counter drop"
 echo "    Remove with: nft delete table inet masscan"
-echo "    See deploy/README.md for the persistent version."
+echo "    See deploy/README.md for the persistent version and the reasoning."
 echo "  * Start a scan session now:  systemctl start proxy-scanner-scan.service"
 echo "  * Follow it:                 journalctl -fu proxy-scanner-scan.service"

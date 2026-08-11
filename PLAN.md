@@ -58,8 +58,8 @@ A system that scans the public IPv4 space for open SOCKS4/SOCKS5 proxies, valida
 
 ### 1. Scanner (masscan CronJob)
 - Alpine-based container with masscan
-- Scans `0.0.0.0/0` minus excluded ranges at 50k pps (~56h full sweep across 3 ports; see README "How long a full sweep takes")
-- Targets SOCKS ports: 1080, 1081, 9050
+- Scans `0.0.0.0/0` minus excluded ranges at 50k pps (~75h full sweep across 4 ports; see README "How long a full sweep takes")
+- Targets SOCKS ports: 1080, 1081, 4145, 9050
 - Outputs JSON to shared PVC
 - Triggers validator job on completion
 
@@ -184,7 +184,7 @@ Published to GHCR:
 
 ## Key Design Decisions
 
-1. **50k pps scan rate** — Conservative for Hetzner Cloud shared NICs. A full IPv4 sweep is ~56h of masscan time across the 3 SOCKS ports (the original ~24h figure assumed a single port), so with `SCAN_TIMEOUT=4h` and the daily cron a sweep completes about every 14 days.
+1. **50k pps scan rate** — Conservative for Hetzner Cloud shared NICs. A full IPv4 sweep is ~75h of masscan time across the 4 SOCKS ports (the original ~24h figure assumed a single port), so with `SCAN_TIMEOUT=4h` and three sessions per day a sweep completes about every 6.2 days.
 2. **SQLite over PostgreSQL** — Write-once-read-many workload. Single writer (validator), single reader (API). WAL mode enables concurrent access. Dataset (50k-200k proxies) fits trivially.
 3. **Separate scan/validate phases** — Masscan excels at raw port discovery. Go excels at concurrent proxy negotiation. Each can be debugged independently.
 4. **CronJob + Job over Deployment** — Batch workloads with clear start/end. No wasted resources between runs.

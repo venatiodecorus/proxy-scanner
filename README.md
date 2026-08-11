@@ -44,7 +44,7 @@ Four components, four container images:
 | Revalidator | `ghcr.io/venatiodecorus/proxy-scanner-revalidator` | Periodically rechecks live proxies and EFnet eligibility, demotes failing or listed ones to `stale`, evicts dead ones |
 | API | `ghcr.io/venatiodecorus/proxy-scanner-api` | REST API serving proxy data from SQLite |
 
-The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates from the default SOCKS port set (`1080,1081,9050`); the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
+The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates from the default SOCKS port set (`1080,1081,4145,9050`); the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
 
 EFnet RBL eligibility is a mandatory hard gate. The validator checks both the proxy endpoint IP and the observed exit IP against `rbl.efnetrbl.org`; a listed address rejects the candidate. The revalidator applies the same checks and marks listed proxies `stale`. Indeterminate EFnet lookups are never treated as eligible: initial validation is deferred, and revalidation fails closed. Optional auxiliary DNSBL checks can be disabled with `SKIP_AUX_BLOCKLISTS=true`, but EFnet checks cannot be disabled.
 
@@ -88,19 +88,26 @@ SCAN_TIMEOUT=4h
 docker compose --profile scan up scanner
 ```
 
-Masscan randomizes scan order by default, so resumed scans won't re-scan previously covered segments.
+Two details of how this build of masscan resumes, both of which the scanner has to work around:
+
+- **Progress lives in the range list, not an index.** `paused.conf` records the *remaining* ranges — there is no `resume-index`. Because masscan treats target ranges as additive, passing `0.0.0.0/0` alongside `--resume` unions the whole address space back in and silently discards all prior progress. `buildMasscanArgs` therefore emits *either* `--resume` *or* a bare target, never both. A resumed session reports fewer hosts than a fresh one; if you ever see a resumed run report the full in-scope count, resume is broken again.
+- **Excludes are not saved.** masscan does not persist `--excludefile` into `paused.conf` (upstream [#110](https://github.com/robertdavidgraham/masscan/issues/110)), so it is re-specified on every invocation, resume included.
+
+When a sweep finishes, the scanner deletes `paused.conf` so the next session starts a fresh pass. masscan only writes that file when interrupted and never clears a stale one, so without this the next session would resume an already-complete sweep and rescan its final chunk indefinitely.
+
+Treat `paused.conf` as part of a specific scan campaign. After changing `SCAN_PORTS`, stop the scanner and remove `/data/paused.conf` before the next session; otherwise the resumed campaign retains progress made with the old port set and the newly added ports will not receive a complete sweep.
 
 ### How long a full sweep takes
 
 | | |
 |---|---|
 | Addresses in scope after exclusions | 3,369,972,995 (78.5% of IPv4) |
-| Ports per address (`SCAN_PORTS`) | 3 |
-| Total probes | 10,109,918,985 |
-| At `SCAN_RATE=50000` | **~56 hours of masscan time** |
-| With `SCAN_TIMEOUT=4h`, sessions per sweep | ~14 |
+| Ports per address (`SCAN_PORTS`) | 4 |
+| Total probes | 13,479,891,980 |
+| At `SCAN_RATE=50000` | **~75 hours of masscan time** |
+| With `SCAN_TIMEOUT=4h`, sessions per sweep | ~19 |
 
-At the default daily cadence that means a full sweep roughly **every 14 days**. Scale from there: doubling `SCAN_RATE` halves it, and so does dropping to a single port. Recompute this if you change `SCAN_PORTS`, `SCAN_RATE`, or the exclusion lists — the probe count is `addresses_in_scope × ports`, and older docs in this repo assumed a single port.
+At the default three-sessions-per-day cadence that means a full sweep roughly **every 6.2 days**. Scale from there: doubling `SCAN_RATE` halves it, and so does dropping to a single port. Recompute this if you change `SCAN_PORTS`, `SCAN_RATE`, or the exclusion lists — the probe count is `addresses_in_scope × ports`, and older docs in this repo assumed a single port.
 
 ## Scan Schedule
 
@@ -108,8 +115,8 @@ Scheduling is handled by systemd timers on the host. See [`deploy/README.md`](de
 
 | Unit | Schedule | Notes |
 |---|---|---|
-| `proxy-scanner-scan.timer` | Daily, 02:00 UTC | One 4h session (`SCAN_TIMEOUT`), then saves resume state |
-| `proxy-scanner-validate.timer` | Daily, 07:00 UTC | Safety net; normally the validator runs via `OnSuccess=` the moment a scan session ends |
+| `proxy-scanner-scan.timer` | Every 8h at 02:00, 10:00, and 18:00 UTC | One 4h session (`SCAN_TIMEOUT`), then saves resume state |
+| `proxy-scanner-validate.timer` | Every 8h at 07:00, 15:00, and 23:00 UTC | Safety net; normally the validator runs via `OnSuccess=` the moment a scan session ends |
 
 ```sh
 systemctl list-timers 'proxy-scanner*'        # what's scheduled
@@ -131,20 +138,46 @@ masscan brings its own IP stack and sends from `--source-port 40000-56383`. The 
 
 Scans work without the rule, so `deploy/install.sh` does not apply it unprompted. Do it before a real sweep.
 
-### Add
+> **Do not add the drop rule on its own.** Linux hands out ephemeral source ports
+> from `32768–60999` by default (`sysctl net.ipv4.ip_local_port_range`), which
+> overlaps `40000–56383`. A bare `tcp dport 40000-56383 drop` on the input hook
+> therefore discards the *return traffic* of any outbound connection that happened
+> to pick a source port in that window — roughly 58% of them. The symptom is
+> outbound connections hanging rather than failing: `docker pull` stalls, `apt
+> update` stalls. Step 1 below is what makes the rule safe.
+
+### Step 1 — reserve the range from ephemeral allocation
+
+```sh
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=40000-56383
+echo 'net.ipv4.ip_local_reserved_ports = 40000-56383' | sudo tee /etc/sysctl.d/99-masscan.conf
+```
+
+`ip_local_reserved_ports` excludes those ports from automatic assignment, so no
+local socket will ever source from them.
+
+### Step 2 — add the rule
 
 The rule goes in its own nftables table. That matters for two reasons: a minimal Debian install may have no `inet filter` table to append to, and a dedicated table can be removed in one command without touching anything else's rules.
 
 ```sh
 sudo nft add table inet masscan
 sudo nft add chain inet masscan input '{ type filter hook input priority -10; policy accept; }'
+sudo nft add rule inet masscan input ct state established,related accept
 sudo nft add rule inet masscan input tcp dport 40000-56383 counter drop
 ```
 
-Verify — the counter should climb while a scan is running:
+The `ct state established,related accept` is belt-and-braces alongside step 1, and
+must come first — nftables evaluates rules in insertion order. `accept` in a base
+chain is not terminal, so packets still traverse chains at higher priority
+numbers and this does not bypass any other firewalling on the host.
+
+Verify. The counter should climb while a scan runs, and normal outbound traffic
+should be unaffected:
 
 ```sh
 sudo nft list table inet masscan
+docker pull alpine && echo "outbound still works"
 ```
 
 Make it survive a reboot by appending the table to `/etc/nftables.conf`:
@@ -153,9 +186,11 @@ Make it survive a reboot by appending the table to `/etc/nftables.conf`:
 sudo tee -a /etc/nftables.conf >/dev/null <<'EOF'
 
 # Drop kernel responses on masscan's source-port range (see README).
+# Safe only in combination with net.ipv4.ip_local_reserved_ports=40000-56383.
 table inet masscan {
     chain input {
         type filter hook input priority -10; policy accept;
+        ct state established,related accept
         tcp dport 40000-56383 counter drop
     }
 }
@@ -169,6 +204,10 @@ sudo nft -c -f /etc/nftables.conf && echo "nftables.conf is valid"
 ```sh
 # Drop it from the running ruleset
 sudo nft delete table inet masscan
+
+# And release the reserved port range
+sudo rm -f /etc/sysctl.d/99-masscan.conf
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=
 ```
 
 Then delete the `table inet masscan { ... }` block from `/etc/nftables.conf` so it does not come back on reboot, and re-validate:
@@ -185,11 +224,13 @@ sudo nft list table inet masscan
 
 ### iptables hosts
 
-If the box uses iptables rather than nftables, the add and remove are symmetric — `-I` to insert, `-D` with the identical rule spec to delete:
+If the box uses iptables rather than nftables, do step 1 the same way, then insert the conntrack accept *above* the drop (`-I` prepends, so insert the drop first):
 
 ```sh
-sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP   # add
-sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP   # remove
+sudo iptables -I INPUT -p tcp --dport 40000:56383 -j DROP                     # add
+sudo iptables -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT   # then this, above it
+
+sudo iptables -D INPUT -p tcp --dport 40000:56383 -j DROP                     # remove
 ```
 
 Persist with `iptables-save > /etc/iptables/rules.v4` (package `iptables-persistent`).
@@ -491,7 +532,7 @@ docker run --rm --entrypoint grep \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCAN_RATE` | `50000` | Masscan packets per second |
-| `SCAN_PORTS` | `1080,1081,9050` | SOCKS target ports (comma-separated) |
+| `SCAN_PORTS` | `1080,1081,4145,9050` | SOCKS target ports (comma-separated) |
 | `SCAN_ADAPTER` | *(empty)* | Network interface for masscan. Empty means masscan auto-detects the default-route interface |
 | `EXCLUDE_FILE` | `/config/exclude.conf` | CIDR exclusion list |
 | `DB_PATH` | `/data/proxies.db` | SQLite database path |
