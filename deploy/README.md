@@ -201,9 +201,9 @@ deploy/
   systemd/
     proxy-scanner.service           API + revalidator (long-running)
     proxy-scanner-scan.service      One masscan session (one-shot)
-    proxy-scanner-scan.timer        Daily at 02:00 UTC
+    proxy-scanner-scan.timer        Every 8h at 02:00, 10:00, 18:00 UTC
     proxy-scanner-validate.service  Drain the candidates queue (one-shot)
-    proxy-scanner-validate.timer    Daily at 07:00 UTC (safety net)
+    proxy-scanner-validate.timer    Every 8h at 07:00, 15:00, 23:00 UTC (safety net)
 ```
 
 On the host:
@@ -288,9 +288,10 @@ curl -s http://127.0.0.1:8080/v1/health
 
 ## Scheduling notes
 
-A full IPv4 sweep is roughly **56 hours** of masscan time (3.37B addresses in
-scope after exclusions × 3 ports ÷ 50k pps). `SCAN_TIMEOUT=4h` bounds each
-session, so a sweep takes about **14 daily sessions ≈ 2 weeks**.
+A full IPv4 sweep is roughly **75 hours** of masscan time (3.37B addresses in
+scope after exclusions × 4 ports ÷ 50k pps). `SCAN_TIMEOUT=4h` bounds each
+session, so a sweep takes about **19 sessions ≈ 6.2 days** at three sessions per
+day.
 
 To change the cadence, edit `OnCalendar=` in
 `/etc/systemd/system/proxy-scanner-scan.timer`, then
@@ -305,8 +306,9 @@ Three properties worth knowing:
 - **The validator chains off the scanner.** `proxy-scanner-scan.service` declares
   `OnSuccess=proxy-scanner-validate.service`, so the queue is drained the moment
   a sweep session ends rather than at a clock time that might land before it
-  finishes. The 07:00 timer is only a safety net for when a scan was skipped but
-  candidates are still pending; an empty queue makes that a no-op. Requires
+  finishes. The 07:00, 15:00, and 23:00 timer firings are only a safety net for
+  when a scan was skipped but candidates are still pending; an empty queue makes
+  them no-ops. Requires
   systemd 249+ (Debian 12 ships 252).
 - **Stopping a scan must send SIGINT.** masscan only writes its resume file on
   SIGINT — SIGTERM kills it and the session's progress is lost. The unit sets

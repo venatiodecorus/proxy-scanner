@@ -40,7 +40,7 @@ services:
       # README. Higher rates are the main driver of abuse complaints and of
       # packet loss on Hetzner Cloud's shared NICs.
       SCAN_RATE: "${SCAN_RATE:-50000}"
-      SCAN_PORTS: "${SCAN_PORTS:-1080,1081,9050}"
+      SCAN_PORTS: "${SCAN_PORTS:-1080,1081,4145,9050}"
       # Leave empty to let masscan pick the default-route interface. Set it in
       # .env only if that guess is wrong (the old hardcoded "ens3" was an
       # OpenStack-ism and does not exist on Debian, where it is usually eth0

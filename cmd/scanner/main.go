@@ -34,7 +34,7 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	scanRate := envOrDefaultInt("SCAN_RATE", 50000)
-	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,9050")
+	scanPorts := envOrDefault("SCAN_PORTS", "1080,1081,4145,9050")
 	// Empty means "let masscan pick the default-route interface". There is
 	// deliberately no default here: hardcoding an interface name (it used to be
 	// the OpenStack-specific "ens3") makes the scanner fail on any host that

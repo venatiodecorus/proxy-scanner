@@ -44,7 +44,7 @@ Four components, four container images:
 | Revalidator | `ghcr.io/venatiodecorus/proxy-scanner-revalidator` | Periodically rechecks live proxies and EFnet eligibility, demotes failing or listed ones to `stale`, evicts dead ones |
 | API | `ghcr.io/venatiodecorus/proxy-scanner-api` | REST API serving proxy data from SQLite |
 
-The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates from the default SOCKS port set (`1080,1081,9050`); the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
+The scanner and validator communicate through a `candidates` table in SQLite (stored on a shared Docker volume). The scanner enqueues IP:port candidates from the default SOCKS port set (`1080,1081,4145,9050`); the validator dequeues, validates, and deletes them. This allows them to run independently — scan one week, validate the next.
 
 EFnet RBL eligibility is a mandatory hard gate. The validator checks both the proxy endpoint IP and the observed exit IP against `rbl.efnetrbl.org`; a listed address rejects the candidate. The revalidator applies the same checks and marks listed proxies `stale`. Indeterminate EFnet lookups are never treated as eligible: initial validation is deferred, and revalidation fails closed. Optional auxiliary DNSBL checks can be disabled with `SKIP_AUX_BLOCKLISTS=true`, but EFnet checks cannot be disabled.
 
@@ -95,17 +95,19 @@ Two details of how this build of masscan resumes, both of which the scanner has 
 
 When a sweep finishes, the scanner deletes `paused.conf` so the next session starts a fresh pass. masscan only writes that file when interrupted and never clears a stale one, so without this the next session would resume an already-complete sweep and rescan its final chunk indefinitely.
 
+Treat `paused.conf` as part of a specific scan campaign. After changing `SCAN_PORTS`, stop the scanner and remove `/data/paused.conf` before the next session; otherwise the resumed campaign retains progress made with the old port set and the newly added ports will not receive a complete sweep.
+
 ### How long a full sweep takes
 
 | | |
 |---|---|
 | Addresses in scope after exclusions | 3,369,972,995 (78.5% of IPv4) |
-| Ports per address (`SCAN_PORTS`) | 3 |
-| Total probes | 10,109,918,985 |
-| At `SCAN_RATE=50000` | **~56 hours of masscan time** |
-| With `SCAN_TIMEOUT=4h`, sessions per sweep | ~14 |
+| Ports per address (`SCAN_PORTS`) | 4 |
+| Total probes | 13,479,891,980 |
+| At `SCAN_RATE=50000` | **~75 hours of masscan time** |
+| With `SCAN_TIMEOUT=4h`, sessions per sweep | ~19 |
 
-At the default daily cadence that means a full sweep roughly **every 14 days**. Scale from there: doubling `SCAN_RATE` halves it, and so does dropping to a single port. Recompute this if you change `SCAN_PORTS`, `SCAN_RATE`, or the exclusion lists — the probe count is `addresses_in_scope × ports`, and older docs in this repo assumed a single port.
+At the default three-sessions-per-day cadence that means a full sweep roughly **every 6.2 days**. Scale from there: doubling `SCAN_RATE` halves it, and so does dropping to a single port. Recompute this if you change `SCAN_PORTS`, `SCAN_RATE`, or the exclusion lists — the probe count is `addresses_in_scope × ports`, and older docs in this repo assumed a single port.
 
 ## Scan Schedule
 
@@ -113,8 +115,8 @@ Scheduling is handled by systemd timers on the host. See [`deploy/README.md`](de
 
 | Unit | Schedule | Notes |
 |---|---|---|
-| `proxy-scanner-scan.timer` | Daily, 02:00 UTC | One 4h session (`SCAN_TIMEOUT`), then saves resume state |
-| `proxy-scanner-validate.timer` | Daily, 07:00 UTC | Safety net; normally the validator runs via `OnSuccess=` the moment a scan session ends |
+| `proxy-scanner-scan.timer` | Every 8h at 02:00, 10:00, and 18:00 UTC | One 4h session (`SCAN_TIMEOUT`), then saves resume state |
+| `proxy-scanner-validate.timer` | Every 8h at 07:00, 15:00, and 23:00 UTC | Safety net; normally the validator runs via `OnSuccess=` the moment a scan session ends |
 
 ```sh
 systemctl list-timers 'proxy-scanner*'        # what's scheduled
@@ -530,7 +532,7 @@ docker run --rm --entrypoint grep \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCAN_RATE` | `50000` | Masscan packets per second |
-| `SCAN_PORTS` | `1080,1081,9050` | SOCKS target ports (comma-separated) |
+| `SCAN_PORTS` | `1080,1081,4145,9050` | SOCKS target ports (comma-separated) |
 | `SCAN_ADAPTER` | *(empty)* | Network interface for masscan. Empty means masscan auto-detects the default-route interface |
 | `EXCLUDE_FILE` | `/config/exclude.conf` | CIDR exclusion list |
 | `DB_PATH` | `/data/proxies.db` | SQLite database path |

@@ -40,7 +40,7 @@ func TestScanOutputTotalsMissingFile(t *testing.T) {
 
 func TestBuildMasscanArgsOmitsAdapterWhenUnset(t *testing.T) {
 	args := buildMasscanArgs(masscanConfig{
-		ports:       "1080,1081,9050",
+		ports:       "1080,1081,4145,9050",
 		excludeFile: "/config/exclude.conf",
 		rate:        50000,
 		adapter:     "",
@@ -114,7 +114,7 @@ func TestBuildMasscanArgsFreshScanTargetsEverything(t *testing.T) {
 // therefore restores the already-scanned space and the sweep never advances.
 func TestBuildMasscanArgsResumeOmitsTarget(t *testing.T) {
 	args := buildMasscanArgs(masscanConfig{
-		ports: "1080,1081,9050", excludeFile: "/config/exclude.conf", rate: 50000,
+		ports: "1080,1081,4145,9050", excludeFile: "/config/exclude.conf", rate: 50000,
 		outputFile: "/data/candidates.json", resumeFile: "/data/paused.conf",
 	})
 
